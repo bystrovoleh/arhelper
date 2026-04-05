@@ -22,7 +22,11 @@ export class PoolRanker {
     const ranked: RankedPool[] = []
 
     for (const pool of WATCHED_POOLS) {
-      const market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
+      if (ranked.length > 0) await new Promise(r => setTimeout(r, 2000))
+      let market: PoolMarketData | null = null
+      try {
+        market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
+      } catch { continue }
       if (!market) continue
 
       const currentPrice = currentPrices.get(pool.address) ?? market.tvlUsd / market.volumeUsd24h

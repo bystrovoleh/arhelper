@@ -64,7 +64,7 @@ export const WATCHED_POOLS: PoolConfig[] = [
     protocol: 'uniswap-v3',
   },
 {
-    address: '0x2f5e87C9312fa29aed5c179e456625D79015299c', // Uniswap v3 WBTC/WETH 0.05%
+    address: '0x2f5e87C9312fa29aed5c179E456625D79015299c', // Uniswap v3 WBTC/WETH 0.05%
     token0: { address: '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', symbol: 'WBTC', decimals: 8 },
     token1: { address: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', symbol: 'WETH', decimals: 18 },
     feeTier: 500,

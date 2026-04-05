@@ -64,16 +64,18 @@ app.get('/api/pools', async (_req, res) => {
     return
   }
   try {
-    const result = await Promise.all(WATCHED_POOLS.map(async pool => {
+    const result = []
+    for (const pool of WATCHED_POOLS) {
+      if (result.length > 0) await new Promise(r => setTimeout(r, 2000))
       const state = await rpcClient.fetchPoolState(pool.address, pool.network, pool.token0.decimals, pool.token1.decimals, pool.protocol)
-      const market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
+      let market = null
+      try { market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier) } catch { /* rate limited */ }
 
-      // Latest snapshot from DB
       const snap = db.prepare(`
         SELECT * FROM pool_snapshots WHERE pool_address = ? ORDER BY recorded_at DESC LIMIT 1
       `).get(pool.address) as any
 
-      return {
+      result.push({
         ...pool,
         currentPrice: state.token0Price,
         tick: state.tick,
@@ -81,8 +83,8 @@ app.get('/api/pools', async (_req, res) => {
         tvlUsd: market?.tvlUsd ?? 0,
         apyBase: market?.apyBase ?? 0,
         estimatedConcentratedApy: snap?.estimated_concentrated_apy ?? 0,
-      }
-    }))
+      })
+    }
     poolsCache = { data: result, ts: Date.now() }
     res.json(result)
   } catch (err) {
