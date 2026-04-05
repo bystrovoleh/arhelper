@@ -33,18 +33,19 @@ export class RangeCalculator {
     const uniToken0 = new UniToken(this.chainId(pool), pool.token0.address, pool.token0.decimals, pool.token0.symbol)
     const uniToken1 = new UniToken(this.chainId(pool), pool.token1.address, pool.token1.decimals, pool.token1.symbol)
 
-    // priceToClosestTick expects a Price<Token, Token> object
-    // We use the SDK's tickToPrice helper in reverse by computing ticks manually
-    // via the log formula: tick = log(price) / log(1.0001)
-    const tickLowerRaw = Math.floor(Math.log(priceLower) / Math.log(1.0001))
-    const tickUpperRaw = Math.ceil(Math.log(priceUpper) / Math.log(1.0001))
+    // tick = log(rawPrice) / log(1.0001)
+    // rawPrice = humanPrice / 10^(decimals0 - decimals1)
+    // For WETH(18)/USDC(6): rawPrice = humanPrice / 1e12
+    const decimalAdj = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
+    const tickLowerRaw = Math.floor(Math.log(priceLower / decimalAdj) / Math.log(1.0001))
+    const tickUpperRaw = Math.ceil(Math.log(priceUpper / decimalAdj) / Math.log(1.0001))
 
     const tickLower = nearestUsableTick(tickLowerRaw, tickSpacing)
     const tickUpper = nearestUsableTick(tickUpperRaw, tickSpacing)
 
-    // Convert back to actual prices for display
-    const actualPriceLower = Math.pow(1.0001, tickLower)
-    const actualPriceUpper = Math.pow(1.0001, tickUpper)
+    // Convert back to actual human-readable prices
+    const actualPriceLower = Math.pow(1.0001, tickLower) * decimalAdj
+    const actualPriceUpper = Math.pow(1.0001, tickUpper) * decimalAdj
 
     const rangePct = (actualPriceUpper / actualPriceLower - 1) / 2
 
