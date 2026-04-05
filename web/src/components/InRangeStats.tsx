@@ -61,10 +61,10 @@ export function InRangeStatsCard({ stats, decision }: { stats: InRangeStats; dec
             {decision.shouldRebalance ? '⚡ Rebalance recommended' : '✓ Hold position'}
           </div>
           <div style={{ fontSize: 11, color: 'var(--text2)', lineHeight: 1.5 }}>{decision.reason}</div>
-          {decision.breakEvenHours < 100 && (
+          {decision.breakEvenHours != null && isFinite(decision.breakEvenHours) && decision.breakEvenHours < 100 && (
             <div style={{ fontSize: 11, color: 'var(--text2)', marginTop: 4 }}>
               Break-even: <span style={{ fontWeight: 600, color: 'var(--text)' }}>{decision.breakEvenHours.toFixed(1)}h</span>
-              {' · '}Fees/hr: <span style={{ fontWeight: 600, color: 'var(--green)' }}>${decision.feesLostPerHourUsd.toFixed(3)}</span>
+              {' · '}Fees/hr: <span style={{ fontWeight: 600, color: 'var(--green)' }}>${(decision.feesLostPerHourUsd ?? 0).toFixed(3)}</span>
             </div>
           )}
         </div>

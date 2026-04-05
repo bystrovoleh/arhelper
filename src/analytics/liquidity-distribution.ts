@@ -170,7 +170,7 @@ export class LiquidityDistribution {
     return Math.pow(1.0001, tick) * Math.pow(10, decimals0 - decimals1)
   }
 
-  private syntheticBuckets(currentTick: number, tickSpacing: number, pool: PoolConfig): LiquidityBucket[] {
+  syntheticBuckets(currentTick: number, tickSpacing: number, pool: PoolConfig): LiquidityBucket[] {
     const buckets: LiquidityBucket[] = []
     const radius = 20
     for (let i = -radius; i < radius; i++) {

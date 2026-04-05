@@ -126,7 +126,13 @@ app.get('/api/pools/:address/liquidity', async (req, res) => {
     const pool = WATCHED_POOLS.find(p => p.address.toLowerCase() === req.params['address']!.toLowerCase())
     if (!pool) { res.status(404).json({ error: 'Pool not found' }); return }
     const state = await rpcClient.fetchPoolState(pool.address, pool.network, pool.token0.decimals, pool.token1.decimals, pool.protocol)
-    const buckets = await liquidityDistribution.fetch(pool, state.tick)
+    let buckets = []
+    try {
+      buckets = await liquidityDistribution.fetch(pool, state.tick)
+    } catch (fetchErr) {
+      console.warn('[liquidity] fetch failed, using synthetic:', String(fetchErr))
+      buckets = (liquidityDistribution as any).syntheticBuckets(state.tick, 10, pool)
+    }
     res.json({ currentTick: state.tick, currentPrice: state.token0Price, buckets })
   } catch (err) {
     res.status(500).json({ error: String(err) })
