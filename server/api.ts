@@ -62,7 +62,7 @@ app.get('/api/pools', async (_req, res) => {
   try {
     const result = await Promise.all(WATCHED_POOLS.map(async pool => {
       const state = await rpcClient.fetchPoolState(pool.address, pool.network, pool.token0.decimals, pool.token1.decimals, pool.protocol)
-      const market = await geckoTerminalClient.fetchPool(pool.address, pool.network)
+      const market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
 
       // Latest snapshot from DB
       const snap = db.prepare(`
@@ -174,7 +174,7 @@ app.get('/api/positions/:tokenId/rebalance-decision', async (req, res) => {
     if (!pool) { res.status(404).json({ error: 'Pool not found' }); return }
 
     const state = await rpcClient.fetchPoolState(pool.address, pool.network, pool.token0.decimals, pool.token1.decimals, pool.protocol)
-    const market = await geckoTerminalClient.fetchPool(pool.address, pool.network)
+    const market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
     const inRange = state.tick >= row.tick_lower && state.tick < row.tick_upper
 
     const decision = gasAdjustedRebalance(

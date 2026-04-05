@@ -81,7 +81,7 @@ export class PaperEngine {
         if (!pool) continue
 
         const state = await rpcClient.fetchPoolState(pool.address, pool.network, pool.token0.decimals, pool.token1.decimals, pool.protocol)
-        const market = await geckoTerminalClient.fetchPool(pool.address, pool.network)
+        const market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
 
         const currentPrice = state.token0Price
         const inRange = state.tick >= row.tick_lower && state.tick < row.tick_upper
@@ -91,7 +91,10 @@ export class PaperEngine {
         const feesUsd = this.estimateAccruedFees(row, market, state, inRange)
 
         // ── IL calculation ───────────────────────────────────────────────────
-        const ilPct = apyCalculator.calculateImpermanentLoss(row.entry_price, currentPrice)
+        const _decAdj = pool ? Math.pow(10, pool.token0.decimals - pool.token1.decimals) : 1e12
+        const _priceLower = Math.pow(1.0001, row.tick_lower) * _decAdj
+        const _priceUpper = Math.pow(1.0001, row.tick_upper) * _decAdj
+        const ilPct = apyCalculator.calculateImpermanentLoss(row.entry_price, currentPrice, _priceLower, _priceUpper)
 
         // ── P&L ──────────────────────────────────────────────────────────────
         // Current value of tokens at current price
@@ -294,8 +297,10 @@ export class PaperEngine {
     //   concentrationFactor = sqrt(upperPrice) * sqrt(lowerPrice) / (sqrt(currentPrice) * (sqrt(upperPrice) - sqrt(lowerPrice)))
     // Then cap it at 20× to avoid unrealistic estimates.
 
-    const priceLower = Math.pow(1.0001, row.tick_lower) * Math.pow(10, 18 - 6) // WETH/USDC
-    const priceUpper = Math.pow(1.0001, row.tick_upper) * Math.pow(10, 18 - 6)
+    const pool = WATCHED_POOLS.find(p => p.address === row.pool_address)
+    const decimalAdj = pool ? Math.pow(10, pool.token0.decimals - pool.token1.decimals) : 1e12
+    const priceLower = Math.pow(1.0001, row.tick_lower) * decimalAdj
+    const priceUpper = Math.pow(1.0001, row.tick_upper) * decimalAdj
     const currentPrice = state.token0Price
 
     let concentrationFactor = 1

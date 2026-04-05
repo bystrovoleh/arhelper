@@ -56,14 +56,45 @@ export class ApyCalculator {
    * Calculate impermanent loss for a given price movement.
    * Returns IL as a negative percentage (e.g. -2.5 means 2.5% loss vs holding).
    */
-  calculateImpermanentLoss(entryPrice: number, currentPrice: number): number {
+  calculateImpermanentLoss(
+    entryPrice: number,
+    currentPrice: number,
+    priceLower?: number,
+    priceUpper?: number,
+  ): number {
     if (entryPrice <= 0) return 0
-    const priceRatio = currentPrice / entryPrice
-    // LP value normalized: 2*sqrt(k) where k = priceRatio
-    // HODL value normalized: (1 + k) / 2
-    // IL is always <= 0
-    const lpValue = 2 * Math.sqrt(priceRatio)
-    const hodlValue = 1 + priceRatio
+    const k = currentPrice / entryPrice
+
+    // If range bounds provided, use concentrated IL formula
+    if (priceLower != null && priceUpper != null && priceLower > 0 && priceUpper > priceLower) {
+      const sqrtK = Math.sqrt(k)
+      const sqrtLower = Math.sqrt(priceLower / entryPrice)
+      const sqrtUpper = Math.sqrt(priceUpper / entryPrice)
+
+      // In-range: standard concentrated IL
+      if (k >= priceLower / entryPrice && k <= priceUpper / entryPrice) {
+        const lpValue = 2 * sqrtK - sqrtLower - (k / sqrtUpper)
+        const hodlValue = 1 + k - sqrtLower - (k / sqrtUpper) // normalized HODL at entry range
+        if (hodlValue <= 0) return 0
+        return ((lpValue / hodlValue) - 1) * 100
+      }
+
+      // Below range: all converted to token0, full IL vs HODL
+      if (k < priceLower / entryPrice) {
+        const lpValue = sqrtUpper - sqrtLower // all token0
+        const hodlValue = 1 + k
+        return ((lpValue * 2 * Math.sqrt(entryPrice) / hodlValue) - 1) * 100
+      }
+
+      // Above range: all converted to token1, full IL vs HODL
+      const lpValue = (1 / sqrtLower - 1 / sqrtUpper) * k
+      const hodlValue = 1 + k
+      return ((lpValue * 2 / hodlValue) - 1) * 100
+    }
+
+    // Fallback: full-range IL formula (always <= 0)
+    const lpValue = 2 * Math.sqrt(k)
+    const hodlValue = 1 + k
     return ((lpValue / hodlValue) - 1) * 100
   }
 

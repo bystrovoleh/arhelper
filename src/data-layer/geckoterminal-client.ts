@@ -35,7 +35,7 @@ export class GeckoTerminalClient {
     })
   }
 
-  async fetchPool(poolAddress: string, network: string): Promise<PoolMarketData | null> {
+  async fetchPool(poolAddress: string, network: string, feeTier?: number): Promise<PoolMarketData | null> {
     const networkSlug = this.networkMap[network] ?? network
     try {
       const { data } = await this.client.get(`/networks/${networkSlug}/pools/${poolAddress}`)
@@ -44,9 +44,9 @@ export class GeckoTerminalClient {
 
       const tvlUsd = parseFloat(attr.reserve_in_usd)
       const volumeUsd24h = parseFloat(attr.volume_usd.h24)
-      // Fee estimate: assume pool fee is baked into volume (rough)
-      // Actual fee = volume × feeTier (provided separately in config)
-      const feesUsd24h = volumeUsd24h * 0.0005 // default 0.05% fee tier placeholder
+      // Use actual fee tier from pool config (e.g. 500 = 0.05%, 3000 = 0.3%)
+      const feeRate = feeTier != null ? feeTier / 1_000_000 : 0.0005
+      const feesUsd24h = volumeUsd24h * feeRate
 
       return {
         address: poolAddress,
