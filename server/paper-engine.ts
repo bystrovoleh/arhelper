@@ -189,8 +189,12 @@ export class PaperEngine {
           })
           await this.paperRebalance(row, pool, state)
         } else {
+          const ageHours = (Date.now() - row.opened_at) / 3_600_000
+          const feesPerHour = ageHours > 0 ? feesUsd / ageHours : 0
+          const feesPerDay = feesPerHour * 24
+          const rangeStatus = inRange ? '✓ IN RANGE' : '✗ OUT OF RANGE'
           logEvent('INFO',
-            `[${row.token_id}] price=$${currentPrice.toFixed(2)} pnl=${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} il=${ilPct.toFixed(2)}% ${inRange ? 'IN_RANGE' : 'OUT_OF_RANGE'}`,
+            `${rangeStatus} | price $${currentPrice.toFixed(2)} | fees +$${feesUsd.toFixed(4)} ($${feesPerDay.toFixed(4)}/day) | pnl ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(4)} | il ${ilPct.toFixed(3)}% | age ${ageHours.toFixed(1)}h`,
             { poolAddress: pool.address, tokenId: row.token_id }
           )
         }
