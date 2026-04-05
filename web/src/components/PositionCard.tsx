@@ -67,8 +67,10 @@ export function PositionCard({ pos }: { pos: Position }) {
   const age = Math.floor((Date.now() - pos.opened_at) / 3600_000)
 
   // Approximate current tick from current price
+  // For WETH(18)/USDC(6): rawPrice = humanPrice / 1e12
+  const DECIMAL_ADJ = 1e12
   const currentTick = pos.current_price
-    ? Math.floor(Math.log(pos.current_price) / Math.log(1.0001))
+    ? Math.floor(Math.log(pos.current_price / DECIMAL_ADJ) / Math.log(1.0001))
     : (pos.tick_lower + pos.tick_upper) / 2
 
   return (
