@@ -276,21 +276,42 @@ export class PaperEngine {
   private estimateAccruedFees(row: any, market: any, state: PoolState, inRange: boolean): number {
     if (!inRange || !market) return 0
 
-    // Get total fees already recorded for this position
+    // Get fees already recorded so we never go backwards
     const existing = db.prepare(
       `SELECT COALESCE(MAX(fees_usd), 0) as total FROM position_snapshots WHERE token_id = ?`
     ).get(row.token_id) as any
-
     const existingFeesUsd: number = existing.total
 
-    // Time-weighted fee accrual: fees per second = daily fees × position share
-    const secondsOpen = (Date.now() - row.opened_at) / 1000
-    const dailyFeesPool = market.feesUsd24h
-    const positionShare = market.tvlUsd > 0 ? row.entry_price_usd / market.tvlUsd : 0
+    // ── Honest fee estimate ────────────────────────────────────────────────────
+    // Real formula: fees = poolFees24h × (myLiquidity / totalLiquidity)
+    //
+    // Since this is paper trading we don't have real liquidity units.
+    // Best proxy: positionShare = capital / TVL (assumes uniform distribution).
+    // This is CONSERVATIVE because concentrated positions earn more per dollar,
+    // but the concentration factor varies by how much of TVL is also concentrated.
+    //
+    // We compute concentration factor from the actual tick range stored in DB:
+    //   concentrationFactor = sqrt(upperPrice) * sqrt(lowerPrice) / (sqrt(currentPrice) * (sqrt(upperPrice) - sqrt(lowerPrice)))
+    // Then cap it at 20× to avoid unrealistic estimates.
 
-    // Apply concentration multiplier (simplified: use default range ±20%)
-    const concentrationMultiplier = 5 // rough 5× for ±20% range
-    const totalEstimatedFees = (dailyFeesPool / 86400) * secondsOpen * positionShare * concentrationMultiplier
+    const priceLower = Math.pow(1.0001, row.tick_lower) * Math.pow(10, 18 - 6) // WETH/USDC
+    const priceUpper = Math.pow(1.0001, row.tick_upper) * Math.pow(10, 18 - 6)
+    const currentPrice = state.token0Price
+
+    let concentrationFactor = 1
+    if (currentPrice > priceLower && currentPrice < priceUpper) {
+      const sqrtU = Math.sqrt(priceUpper)
+      const sqrtL = Math.sqrt(priceLower)
+      const sqrtC = Math.sqrt(currentPrice)
+      const denom = sqrtC * (sqrtU - sqrtL)
+      if (denom > 0) {
+        concentrationFactor = Math.min((sqrtU * sqrtL) / denom, 20) // cap at 20×
+      }
+    }
+
+    const secondsOpen = (Date.now() - row.opened_at) / 1000
+    const positionShare = market.tvlUsd > 0 ? row.entry_price_usd / market.tvlUsd : 0
+    const totalEstimatedFees = (market.feesUsd24h / 86400) * secondsOpen * positionShare * concentrationFactor
 
     return Math.max(totalEstimatedFees, existingFeesUsd)
   }
