@@ -1,6 +1,7 @@
 import { db, logEvent } from './db'
 import { rpcClient } from '../src/data-layer/rpc-client'
 import { geckoTerminalClient } from '../src/data-layer/geckoterminal-client'
+import { theGraphClient } from '../src/data-layer/thegraph-client'
 import { apyCalculator } from '../src/analytics/apy-calculator'
 import { rebalanceTrigger } from '../src/strategy/rebalance-trigger'
 import { rangeCalculator } from '../src/strategy/range-calculator'
@@ -38,8 +39,9 @@ export class PaperEngine {
     const state = await rpcClient.fetchPoolState(pool.address, pool.network, pool.token0.decimals, pool.token1.decimals, pool.protocol)
     const currentPrice = state.token0Price
 
-    const ohlcv = await geckoTerminalClient.fetchOhlcv(pool.address, pool.network, 'hour', 24)
-    const range = rangeCalculator.buildOptimalRange(currentPrice, pool, ohlcv)
+    const candles = await this.fetchCandles(pool.address, pool.network)
+    const range = rangeCalculator.buildAgentRange(currentPrice, pool, candles)
+      ?? rangeCalculator.buildSymmetricRange(currentPrice, pool, 0.15)
 
     // Split capital 50/50 between token0 and token1
     const token0Amount = (capitalUsd / 2) / currentPrice
@@ -91,7 +93,7 @@ export class PaperEngine {
         if (!pool) continue
 
         const state = await rpcClient.fetchPoolState(pool.address, pool.network, pool.token0.decimals, pool.token1.decimals, pool.protocol)
-        const market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
+        const market = await this.fetchMarket(pool)
 
         const currentPrice = state.token0Price
         const inRange = state.tick >= row.tick_lower && state.tick < row.tick_upper
@@ -130,9 +132,11 @@ export class PaperEngine {
 
         // ── Save pool snapshot ───────────────────────────────────────────────
         if (market) {
-          const range = rangeCalculator.buildOptimalRange(currentPrice, pool, [])
+          const _decAdj2 = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
+          const _pL = Math.pow(1.0001, row.tick_lower) * _decAdj2
+          const _pU = Math.pow(1.0001, row.tick_upper) * _decAdj2
           const concentratedApy = apyCalculator.estimateConcentratedApy(
-            market.apyBase, range.priceLower, range.priceUpper, currentPrice
+            market.apyBase, _pL, _pU, currentPrice
           )
           db.prepare(`
             INSERT INTO pool_snapshots
@@ -147,39 +151,6 @@ export class PaperEngine {
         }
 
         // ── Rebalance check ──────────────────────────────────────────────────
-        const MIN_POSITION_AGE_MS = 4 * 3_600_000   // must hold at least 4h before rebalancing
-        const MIN_OUT_OF_RANGE_MS = 2 * 3_600_000   // must be out of range for 2h+ consecutively
-
-        const positionAgeMs = Date.now() - row.opened_at
-        if (positionAgeMs < MIN_POSITION_AGE_MS) {
-          logEvent('INFO',
-            `[${row.token_id}] price=$${currentPrice.toFixed(2)} pnl=${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} il=${ilPct.toFixed(2)}% ${inRange ? 'IN_RANGE' : 'OUT_OF_RANGE'} (cooldown: ${((MIN_POSITION_AGE_MS - positionAgeMs) / 3_600_000).toFixed(1)}h left)`,
-            { poolAddress: pool.address, tokenId: row.token_id }
-          )
-          continue
-        }
-
-        // Check how long we've been out of range consecutively
-        if (!inRange) {
-          // Find the most recent snapshot where we WERE in range — out-of-range streak starts after that
-          const lastInRange = db.prepare(`
-            SELECT recorded_at FROM position_snapshots
-            WHERE token_id = ? AND in_range = 1
-            ORDER BY recorded_at DESC
-            LIMIT 1
-          `).get(row.token_id) as any
-          const outOfRangeMs = lastInRange?.recorded_at
-            ? Date.now() - lastInRange.recorded_at
-            : Date.now() - row.opened_at
-
-          if (outOfRangeMs < MIN_OUT_OF_RANGE_MS) {
-            logEvent('INFO',
-              `[${row.token_id}] OUT_OF_RANGE for ${(outOfRangeMs / 60_000).toFixed(0)}min — waiting for ${(MIN_OUT_OF_RANGE_MS / 3_600_000).toFixed(0)}h before rebalance`,
-              { poolAddress: pool.address, tokenId: row.token_id }
-            )
-            continue
-          }
-        }
 
         const position: Position = {
           tokenId: BigInt(0),
@@ -195,7 +166,7 @@ export class PaperEngine {
           openedAt: row.opened_at,
         }
 
-        const signal = rebalanceTrigger.evaluate(position, state, 0.3, market?.tvlUsd ?? 0)
+        const signal = rebalanceTrigger.evaluate(position, state)
 
         if (signal.shouldRebalance && signal.urgency === 'high') {
           logEvent('SIGNAL', `Rebalance signal: ${signal.reason}`, {
@@ -223,8 +194,9 @@ export class PaperEngine {
 
   private async paperRebalance(row: any, pool: any, state: PoolState) {
     const currentPrice = state.token0Price
-    const ohlcv = await geckoTerminalClient.fetchOhlcv(pool.address, pool.network, 'hour', 24)
-    const newRange = rangeCalculator.buildOptimalRange(currentPrice, pool, ohlcv)
+    const candles = await this.fetchCandles(pool.address, pool.network)
+    const newRange = rangeCalculator.buildAgentRange(currentPrice, pool, candles)
+      ?? rangeCalculator.buildSymmetricRange(currentPrice, pool, 0.15)
 
     // Close old
     db.prepare(`UPDATE positions SET status = 'rebalanced', closed_at = ? WHERE token_id = ?`)
@@ -330,6 +302,40 @@ export class PaperEngine {
       console.warn('[fees] real fee calc failed:', err)
       return 0
     }
+  }
+
+  // ── Market data cache (refresh every 5 min) ───────────────────────────────
+  private marketCache: Map<string, { data: any; ts: number }> = new Map()
+  private readonly MARKET_CACHE_TTL = 5 * 60_000
+
+  private async fetchMarket(pool: any) {
+    const cached = this.marketCache.get(pool.address)
+    if (cached && Date.now() - cached.ts < this.MARKET_CACHE_TTL) return cached.data
+    const data = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
+    if (data) this.marketCache.set(pool.address, { data, ts: Date.now() })
+    return data
+  }
+
+  // ── Candle cache (refresh every 4h to avoid hammering The Graph) ───────────
+  private candleCache: { candles: any[]; ts: number } | null = null
+  private readonly CANDLE_CACHE_TTL = 4 * 3_600_000
+
+  private async fetchCandles(poolAddress: string, network: string) {
+    if (this.candleCache && Date.now() - this.candleCache.ts < this.CANDLE_CACHE_TTL) {
+      return this.candleCache.candles
+    }
+    try {
+      const candles = await theGraphClient.fetchWethUsdcCandles(2000)
+      if (candles.length >= 48) {
+        this.candleCache = { candles, ts: Date.now() }
+        return candles
+      }
+    } catch {
+      // fallback to GeckoTerminal
+    }
+    const candles = await geckoTerminalClient.fetchOhlcv(poolAddress, network, 'hour', 168)
+    this.candleCache = { candles, ts: Date.now() }
+    return candles
   }
 }
 

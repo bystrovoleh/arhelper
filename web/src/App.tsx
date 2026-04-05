@@ -50,10 +50,10 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('overview')
   const [opening, setOpening] = useState(false)
 
-  const { data: stats, refetch: refetchStats } = useApi<any>('/api/stats', 15_000)
-  const { data: positions } = useApi<any[]>('/api/positions', 15_000)
-  const { data: pools } = useApi<any[]>('/api/pools', 60_000)
-  const { data: events } = useApi<any[]>('/api/events?limit=100', 10_000)
+  const { data: stats, refetch: refetchStats } = useApi<any>('/api/stats', 30_000)
+  const { data: positions } = useApi<any[]>('/api/positions', 30_000)
+  const { data: pools } = useApi<any[]>('/api/pools', 120_000)
+  const { data: events } = useApi<any[]>('/api/events?limit=100', 30_000)
 
   // Snapshots for the first open position
   const firstOpen = positions?.find((p: any) => p.status === 'open')
@@ -74,7 +74,7 @@ export default function App() {
   )
   const { data: rebalanceDecisionData } = useApi<any>(
     tab === 'analytics' && firstOpen ? `/api/positions/${firstOpen.token_id}/rebalance-decision` : '/api/stats',
-    30_000
+    5 * 60_000  // 5 min — matches server cache TTL
   )
 
   async function openPaperPosition() {
@@ -137,31 +137,40 @@ export default function App() {
               <StatCard
                 label="Active Position"
                 value={firstOpen ? `${firstOpen.token0_symbol}/${firstOpen.token1_symbol}` : '—'}
-                sub={firstOpen ? `${Math.floor((Date.now() - firstOpen.opened_at) / 3_600_000)}h running` : 'No position'}
+                sub={firstOpen
+                  ? (() => {
+                      const h = (Date.now() - firstOpen.opened_at) / 3_600_000
+                      const d = Math.floor(h / 24), rh = Math.floor(h % 24)
+                      return d > 0 ? `${d}d ${rh}h running` : `${rh}h running`
+                    })()
+                  : 'No position'}
                 color="blue"
               />
               <StatCard
-                label="Fees Earned (no rebalance)"
+                label="Fees Earned"
                 value={`$${fees.toFixed(4)}`}
                 sub={firstOpen
                   ? (() => {
                       const ageHours = (Date.now() - firstOpen.opened_at) / 3_600_000
                       if (ageHours < 1) return 'accumulating…'
-                      return `$${((fees / ageHours) * 24).toFixed(4)}/day est.`
+                      return `$${((fees / ageHours) * 24).toFixed(4)}/day`
                     })()
-                  : ''}
+                  : '—'}
                 color="green"
               />
               <StatCard
                 label="Total P&L"
                 value={`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`}
-                sub={firstOpen ? (firstOpen.in_range == null ? '…' : firstOpen.in_range ? '✓ In range' : '✗ Out of range') : ''}
+                sub={firstOpen
+                  ? (firstOpen.in_range == null ? '…'
+                    : firstOpen.in_range ? '✓ In range' : '✗ Out of range')
+                  : ''}
                 color={pnl >= 0 ? 'green' : 'red'}
               />
               <StatCard
-                label="IL"
+                label="IL / Rebalances"
                 value={firstOpen?.il_pct != null ? `${(firstOpen.il_pct as number).toFixed(3)}%` : '—'}
-                sub="vs holding"
+                sub={`${stats?.rebalances ?? 0} rebalances total`}
                 color={firstOpen?.il_pct != null && (firstOpen.il_pct as number) < -1 ? 'red' : 'default'}
               />
             </div>
@@ -181,6 +190,38 @@ export default function App() {
                 }
               </div>
             </div>
+
+            {/* Rebalance history */}
+            {(positions ?? []).filter((p: any) => p.status === 'rebalanced').length > 0 && (
+              <div style={S.card}>
+                <div style={S.sectionTitle}>Rebalance History</div>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ color: 'var(--text2)', textAlign: 'left' }}>
+                      {['Pair', 'Opened', 'Closed', 'Age', 'P&L', 'Fees'].map(h => (
+                        <th key={h} style={{ padding: '6px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(positions ?? []).filter((p: any) => p.status === 'rebalanced').slice(0, 10).map((p: any) => {
+                      const ageH = p.closed_at ? ((p.closed_at - p.opened_at) / 3_600_000).toFixed(1) : '—'
+                      const pnl = p.pnl_usd ?? 0
+                      return (
+                        <tr key={p.token_id} style={{ borderBottom: '1px solid var(--border)' }}>
+                          <td style={{ padding: '8px 10px', color: 'var(--text)' }}>{p.token0_symbol}/{p.token1_symbol}</td>
+                          <td style={{ padding: '8px 10px', color: 'var(--text2)' }}>{new Date(p.opened_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
+                          <td style={{ padding: '8px 10px', color: 'var(--text2)' }}>{p.closed_at ? new Date(p.closed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                          <td style={{ padding: '8px 10px', color: 'var(--text2)' }}>{ageH}h</td>
+                          <td style={{ padding: '8px 10px', color: pnl >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}</td>
+                          <td style={{ padding: '8px 10px', color: 'var(--green)' }}>${(p.fees_usd ?? 0).toFixed(4)}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
 
             <div style={S.card}>
               <div style={S.sectionTitle}>Recent Events</div>

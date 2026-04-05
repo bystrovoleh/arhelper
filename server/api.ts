@@ -54,6 +54,10 @@ app.get('/api/events', (req, res) => {
 let poolsCache: { data: any[]; ts: number } | null = null
 const POOLS_CACHE_TTL = 60_000 // refresh at most once per minute
 
+// Cache for rebalance-decision (expensive: RPC + GeckoTerminal)
+const rebalanceDecisionCache = new Map<string, { data: any; ts: number }>()
+const REBALANCE_DECISION_CACHE_TTL = 5 * 60_000 // 5 minutes
+
 app.get('/api/pools', async (_req, res) => {
   if (poolsCache && Date.now() - poolsCache.ts < POOLS_CACHE_TTL) {
     res.json(poolsCache.data)
@@ -169,7 +173,14 @@ app.get('/api/pools/:address/inrange', (req, res) => {
 // Gas-adjusted rebalance decision for open position
 app.get('/api/positions/:tokenId/rebalance-decision', async (req, res) => {
   try {
-    const row = db.prepare(`SELECT * FROM positions WHERE token_id = ?`).get(req.params['tokenId']) as any
+    const tokenId = req.params['tokenId']!
+    const cached = rebalanceDecisionCache.get(tokenId)
+    if (cached && Date.now() - cached.ts < REBALANCE_DECISION_CACHE_TTL) {
+      res.json(cached.data)
+      return
+    }
+
+    const row = db.prepare(`SELECT * FROM positions WHERE token_id = ?`).get(tokenId) as any
     if (!row) { res.status(404).json({ error: 'Not found' }); return }
 
     const pool = WATCHED_POOLS.find(p => p.address === row.pool_address)
@@ -183,7 +194,7 @@ app.get('/api/positions/:tokenId/rebalance-decision', async (req, res) => {
       pool.address,
       row.entry_price_usd,
       inRange,
-      0.30, // ~$0.30 gas on Base
+      0.30,
       market?.tvlUsd ?? 0,
     )
 
@@ -194,7 +205,9 @@ app.get('/api/positions/:tokenId/rebalance-decision', async (req, res) => {
       Math.pow(1.0001, row.tick_upper) * Math.pow(10, pool.token0.decimals - pool.token1.decimals),
     )
 
-    res.json({ decision, regime, inRangeStats })
+    const result = { decision, regime, inRangeStats }
+    rebalanceDecisionCache.set(tokenId, { data: result, ts: Date.now() })
+    res.json(result)
   } catch (err) {
     res.status(500).json({ error: String(err) })
   }

@@ -17,7 +17,6 @@ interface Position {
   in_range?: number
 }
 
-// WETH(18)/USDC(6): price = 1.0001^tick * 10^(18-6) = 1.0001^tick * 1e12
 const tickToPrice = (tick: number) => Math.pow(1.0001, tick) * 1e12
 
 function RangeBar({ tickLower, tickUpper, currentTick, currentPrice }: {
@@ -28,34 +27,59 @@ function RangeBar({ tickLower, tickUpper, currentTick, currentPrice }: {
   const inRange = currentTick >= tickLower && currentTick < tickUpper
   const priceLower = tickToPrice(tickLower)
   const priceUpper = tickToPrice(tickUpper)
+  const rangeWidthPct = ((priceUpper / priceLower - 1) * 100).toFixed(1)
+
+  // How far from boundaries (% of range)
+  const distFromLower = currentPrice ? ((currentPrice - priceLower) / (priceUpper - priceLower) * 100).toFixed(0) : null
+  const distFromUpper = currentPrice ? ((priceUpper - currentPrice) / (priceUpper - priceLower) * 100).toFixed(0) : null
 
   return (
-    <div style={{ margin: '12px 0 4px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text2)', marginBottom: 4 }}>
-        <span>${priceLower.toFixed(0)}</span>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1 }}>
-          <span style={{ color: inRange ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
-            {inRange ? 'IN RANGE' : 'OUT OF RANGE'}
-          </span>
-          {currentPrice && (
-            <span style={{ color: 'var(--blue)', fontSize: 10 }}>${currentPrice.toFixed(2)}</span>
-          )}
+    <div style={{ margin: '14px 0 4px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text2)', marginBottom: 6 }}>
+        <div>
+          <div style={{ fontWeight: 600, color: 'var(--text)' }}>${priceLower.toFixed(0)}</div>
+          <div style={{ marginTop: 2 }}>lower</div>
         </div>
-        <span>${priceUpper.toFixed(0)}</span>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ color: inRange ? 'var(--green)' : 'var(--red)', fontWeight: 700, fontSize: 12 }}>
+            {inRange ? '● IN RANGE' : '○ OUT OF RANGE'}
+          </div>
+          {currentPrice && (
+            <div style={{ color: 'var(--blue)', fontSize: 13, fontWeight: 600, marginTop: 2 }}>
+              ${currentPrice.toFixed(2)}
+            </div>
+          )}
+          <div style={{ color: 'var(--text2)', fontSize: 10, marginTop: 2 }}>
+            range width {rangeWidthPct}%
+          </div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div style={{ fontWeight: 600, color: 'var(--text)' }}>${priceUpper.toFixed(0)}</div>
+          <div style={{ marginTop: 2 }}>upper</div>
+        </div>
       </div>
-      <div style={{ height: 6, background: 'var(--bg3)', borderRadius: 3, position: 'relative' }}>
+
+      <div style={{ height: 8, background: 'var(--bg3)', borderRadius: 4, position: 'relative', marginTop: 4 }}>
         <div style={{
           position: 'absolute', left: 0, right: 0, top: 0, bottom: 0,
-          background: inRange ? 'rgba(34,197,94,0.25)' : 'rgba(239,68,68,0.15)',
-          borderRadius: 3,
+          background: inRange ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.12)',
+          borderRadius: 4,
         }} />
         <div style={{
-          position: 'absolute', top: -3, width: 12, height: 12,
+          position: 'absolute', top: -4, width: 16, height: 16,
           background: inRange ? 'var(--green)' : 'var(--red)',
-          borderRadius: '50%', left: `calc(${pos * 100}% - 6px)`,
+          borderRadius: '50%', left: `calc(${pos * 100}% - 8px)`,
           border: '2px solid var(--bg2)',
+          boxShadow: `0 0 6px ${inRange ? 'rgba(34,197,94,0.5)' : 'rgba(239,68,68,0.5)'}`,
         }} />
       </div>
+
+      {inRange && distFromLower && distFromUpper && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text2)', marginTop: 6 }}>
+          <span>{distFromLower}% from lower</span>
+          <span>{distFromUpper}% from upper</span>
+        </div>
+      )}
     </div>
   )
 }
@@ -64,63 +88,120 @@ export function PositionCard({ pos }: { pos: Position }) {
   const pnl = pos.pnl_usd ?? 0
   const fees = pos.fees_usd ?? 0
   const il = pos.il_pct ?? 0
-  const age = Math.floor((Date.now() - pos.opened_at) / 3600_000)
+  const ageMs = Date.now() - pos.opened_at
+  const ageHours = ageMs / 3_600_000
+  const ageDays = Math.floor(ageHours / 24)
+  const ageRemHours = Math.floor(ageHours % 24)
+  const ageLabel = ageDays > 0 ? `${ageDays}d ${ageRemHours}h` : `${Math.floor(ageHours)}h`
 
-  // Approximate current tick from current price
-  // For WETH(18)/USDC(6): rawPrice = humanPrice / 1e12
+  const feesPerDay = ageHours > 1 ? (fees / ageHours) * 24 : null
+  const pnlPct = pos.entry_price_usd > 0 ? (pnl / pos.entry_price_usd) * 100 : 0
+  const feesPct = pos.entry_price_usd > 0 ? (fees / pos.entry_price_usd) * 100 : 0
+
   const DECIMAL_ADJ = 1e12
   const currentTick = pos.current_price
     ? Math.floor(Math.log(pos.current_price / DECIMAL_ADJ) / Math.log(1.0001))
     : (pos.tick_lower + pos.tick_upper) / 2
 
+  const priceLower = tickToPrice(pos.tick_lower)
+  const priceUpper = tickToPrice(pos.tick_upper)
+  const priceChangeFromEntry = pos.entry_price && pos.current_price
+    ? ((pos.current_price - pos.entry_price) / pos.entry_price * 100)
+    : null
+
+  const isOpen = pos.status === 'open'
+
   return (
     <div style={{
       background: 'var(--bg2)',
-      border: `1px solid ${pos.in_range ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
+      border: `1px solid ${isOpen ? (pos.in_range ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)') : 'var(--border)'}`,
       borderRadius: 12,
       padding: 20,
+      opacity: isOpen ? 1 : 0.7,
     }}>
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
         <div>
-          <div style={{ fontWeight: 600, fontSize: 16 }}>
-            {pos.token0_symbol}/{pos.token1_symbol}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontWeight: 700, fontSize: 16 }}>
+              {pos.token0_symbol}/{pos.token1_symbol}
+            </span>
+            <span style={{
+              fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 99,
+              background: isOpen ? 'rgba(34,197,94,0.15)' : 'rgba(100,100,100,0.15)',
+              color: isOpen ? 'var(--green)' : 'var(--text2)',
+              border: `1px solid ${isOpen ? 'rgba(34,197,94,0.3)' : 'var(--border)'}`,
+            }}>
+              {pos.status.toUpperCase()}
+            </span>
           </div>
-          <div style={{ color: 'var(--text2)', fontSize: 12, marginTop: 2 }}>
-            {pos.protocol} · {pos.network} · {age}h ago
+          <div style={{ color: 'var(--text2)', fontSize: 12, marginTop: 3 }}>
+            {pos.protocol} · {pos.network} · opened {ageLabel} ago
           </div>
         </div>
         <div style={{ textAlign: 'right' }}>
-          <div style={{
-            fontSize: 18, fontWeight: 600,
-            color: pnl >= 0 ? 'var(--green)' : 'var(--red)',
-          }}>
+          <div style={{ fontSize: 20, fontWeight: 700, color: pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
             {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USD
           </div>
-          <div style={{ color: 'var(--text2)', fontSize: 12 }}>P&L</div>
+          <div style={{ color: 'var(--text2)', fontSize: 12, marginTop: 1 }}>
+            {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}% on capital
+          </div>
         </div>
       </div>
 
       {/* Range bar */}
-      <RangeBar tickLower={pos.tick_lower} tickUpper={pos.tick_upper} currentTick={currentTick} currentPrice={pos.current_price} />
+      <RangeBar
+        tickLower={pos.tick_lower}
+        tickUpper={pos.tick_upper}
+        currentTick={currentTick}
+        currentPrice={pos.current_price}
+      />
 
-      {/* Stats row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12, marginTop: 16 }}>
+      {/* Stats grid */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginTop: 16 }}>
         {[
-          { label: 'Fees earned', value: `$${fees.toFixed(3)}`, color: 'var(--green)' },
-          { label: 'Imp. Loss', value: `${il.toFixed(2)}%`, color: il < -1 ? 'var(--red)' : 'var(--text2)' },
-          { label: 'Capital', value: `$${pos.entry_price_usd.toFixed(0)}`, color: 'var(--text)' },
+          {
+            label: 'Fees Earned',
+            value: `$${fees.toFixed(4)}`,
+            sub: feesPerDay != null ? `$${feesPerDay.toFixed(4)}/day` : 'accumulating…',
+            color: 'var(--green)',
+          },
+          {
+            label: 'Fees %',
+            value: `${feesPct.toFixed(3)}%`,
+            sub: feesPerDay != null ? `${(feesPct / ageHours * 24).toFixed(3)}%/day` : '',
+            color: 'var(--green)',
+          },
+          {
+            label: 'Imp. Loss',
+            value: `${il.toFixed(3)}%`,
+            sub: 'vs holding',
+            color: il < -1 ? 'var(--red)' : 'var(--text2)',
+          },
+          {
+            label: 'Price Change',
+            value: priceChangeFromEntry != null ? `${priceChangeFromEntry >= 0 ? '+' : ''}${priceChangeFromEntry.toFixed(2)}%` : '—',
+            sub: `entry $${pos.entry_price.toFixed(0)}`,
+            color: priceChangeFromEntry != null && priceChangeFromEntry >= 0 ? 'var(--green)' : 'var(--red)',
+          },
         ].map(s => (
           <div key={s.label} style={{ background: 'var(--bg3)', borderRadius: 8, padding: '10px 12px' }}>
             <div style={{ color: 'var(--text2)', fontSize: 11, marginBottom: 4 }}>{s.label}</div>
-            <div style={{ fontWeight: 600, color: s.color }}>{s.value}</div>
+            <div style={{ fontWeight: 600, color: s.color, fontSize: 14 }}>{s.value}</div>
+            {s.sub && <div style={{ color: 'var(--text2)', fontSize: 10, marginTop: 2 }}>{s.sub}</div>}
           </div>
         ))}
       </div>
 
-      {/* Token ID */}
-      <div style={{ marginTop: 12, color: 'var(--text2)', fontSize: 11 }}>
-        ID: {pos.token_id}
+      {/* Range info row */}
+      <div style={{
+        display: 'flex', gap: 16, marginTop: 12, padding: '10px 12px',
+        background: 'var(--bg3)', borderRadius: 8, fontSize: 12,
+      }}>
+        <span style={{ color: 'var(--text2)' }}>Capital: <span style={{ color: 'var(--text)', fontWeight: 600 }}>${pos.entry_price_usd.toFixed(0)}</span></span>
+        <span style={{ color: 'var(--text2)' }}>Range: <span style={{ color: 'var(--text)', fontWeight: 600 }}>${priceLower.toFixed(0)} – ${priceUpper.toFixed(0)}</span></span>
+        <span style={{ color: 'var(--text2)' }}>Width: <span style={{ color: 'var(--text)', fontWeight: 600 }}>{((priceUpper / priceLower - 1) * 100).toFixed(1)}%</span></span>
+        <span style={{ color: 'var(--text2)', marginLeft: 'auto', fontSize: 11 }}>ID: {pos.token_id}</span>
       </div>
     </div>
   )

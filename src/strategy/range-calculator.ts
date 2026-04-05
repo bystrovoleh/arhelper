@@ -3,6 +3,8 @@ import { Token as UniToken } from '@uniswap/sdk-core'
 import { PoolConfig, PoolState, RangeRecommendation } from '../types'
 import { STRATEGY } from '../config'
 import { detectVolatilityRegime, calcInRangeTime } from '../analytics/range-analytics'
+import { trendAnalyzer, RangeAdvice } from './trend-analyzer'
+import type { OhlcvCandle } from '../backtest/types'
 
 // ─── Range Calculator ─────────────────────────────────────────────────────────
 // Converts price targets to aligned Uniswap v3 ticks.
@@ -163,6 +165,46 @@ export class RangeCalculator {
     const variance = returns.reduce((s, r) => s + Math.pow(r - mean, 2), 0) / returns.length
     const dailySigma = Math.sqrt(variance) * Math.sqrt(24)
     return Math.min(Math.max(dailySigma * 2, 0.05), 0.50)
+  }
+
+  /**
+   * Agent-based range: uses TrendAnalyzer for multi-timeframe analysis.
+   * Returns asymmetric range shifted toward trend direction.
+   * If shouldOpen=false, returns null — caller should not open position.
+   */
+  buildAgentRange(
+    currentPrice: number,
+    pool: PoolConfig,
+    candles: OhlcvCandle[],
+  ): (RangeRecommendation & { advice: RangeAdvice }) | null {
+    const advice = trendAnalyzer.analyze(candles, currentPrice)
+
+    if (!advice.shouldOpen) {
+      console.log(`[Agent] Not opening: ${advice.reason}`)
+      return null
+    }
+
+    // Asymmetric boundaries
+    const priceLower = currentPrice * (1 - advice.rangePct - advice.lowerBias)
+    const priceUpper = currentPrice * (1 + advice.rangePct + advice.upperBias)
+
+    const range = this.priceRangeToTicks(priceLower, priceUpper, pool)
+
+    const globalDir = advice.global.direction
+    const localDir  = advice.local.direction
+    range.reason = [
+      `Agent ±${(advice.rangePct * 100).toFixed(0)}%`,
+      advice.lowerBias !== 0 || advice.upperBias !== 0
+        ? `[${priceLower.toFixed(0)}–${priceUpper.toFixed(0)}]`
+        : '',
+      `| global=${globalDir}(${(advice.global.confidence * 100).toFixed(0)}%)`,
+      `local=${localDir}(${(advice.local.confidence * 100).toFixed(0)}%)`,
+      `| vol=${advice.local.volatilityPct.toFixed(1)}%/day`,
+      `| conf=${(advice.confidence * 100).toFixed(0)}%`,
+      `| ${advice.reason}`,
+    ].filter(Boolean).join(' ')
+
+    return { ...range, advice }
   }
 
   private chainId(pool: PoolConfig): number {

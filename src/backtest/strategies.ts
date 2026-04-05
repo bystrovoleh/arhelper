@@ -1,4 +1,5 @@
 import type { OhlcvCandle } from './types'
+import { trendAnalyzer } from '../strategy/trend-analyzer'
 
 export interface RangeDecision {
   priceLower: number
@@ -18,6 +19,28 @@ export function strategyFixed10(currentPrice: number): RangeDecision {
   return {
     priceLower: currentPrice * 0.90,
     priceUpper: currentPrice * 1.10,
+  }
+}
+
+// ── Strategy D: Fixed ±15% ────────────────────────────────────────────────────
+export function strategyFixed15(currentPrice: number): RangeDecision {
+  return {
+    priceLower: currentPrice * 0.85,
+    priceUpper: currentPrice * 1.15,
+  }
+}
+
+// ── Strategy E: Agent (multi-timeframe trend + asymmetric range) ──────────────
+export function strategyAgent(currentPrice: number, recentCandles: OhlcvCandle[]): RangeDecision {
+  if (recentCandles.length < 48) return strategyFixed15(currentPrice)
+
+  const advice = trendAnalyzer.analyze(recentCandles, currentPrice)
+
+  if (!advice.shouldOpen) return strategyFixed15(currentPrice)
+
+  return {
+    priceLower: currentPrice * (1 - advice.rangePct - advice.lowerBias),
+    priceUpper: currentPrice * (1 + advice.rangePct + advice.upperBias),
   }
 }
 

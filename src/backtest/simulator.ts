@@ -64,7 +64,10 @@ export class SimulationEngine {
         const poolFees1h = volumeUsd * feeTierPct
         const positionShare = tvlUsd > 0 ? capitalNow / tvlUsd : 0
         const cf = this.concentrationFactor(position.priceLower, position.priceUpper, price)
-        feesThisCandle = poolFees1h * positionShare * cf
+        // Apply 0.38 correction factor: real on-chain liquidity share is ~2.6x lower
+        // than capital/TVL proxy (measured empirically on this pool)
+        const REAL_SHARE_CORRECTION = 0.38
+        feesThisCandle = poolFees1h * positionShare * cf * REAL_SHARE_CORRECTION
         cumulativeFeesUsd += feesThisCandle
       }
 
@@ -139,41 +142,37 @@ export class SimulationEngine {
   private lpValueFraction(entryPrice: number, currentPrice: number, priceLower: number, priceUpper: number): number {
     if (entryPrice <= 0) return 1
 
-    // At entry, capital split 50/50:
-    // token0 = 0.5 / entryPrice (in token0 units)
-    // token1 = 0.5 (in token1 units, normalized to 1 USD = 1 unit)
-    const token0Entry = 0.5 / entryPrice
-    const token1Entry = 0.5
-
     const sqrtEntry = Math.sqrt(entryPrice)
     const sqrtLower = Math.sqrt(priceLower)
     const sqrtUpper = Math.sqrt(priceUpper)
     const sqrtCurrent = Math.sqrt(currentPrice)
 
-    // Liquidity L from entry position (Uniswap v3 formula)
-    // L = token1Entry / (sqrtEntry - sqrtLower)  (from token1 side)
-    const L = token1Entry / (sqrtEntry - sqrtLower)
+    // Derive L from $1 of capital deposited at entryPrice.
+    // In Uniswap v3 the correct token split for liquidity L at price P is:
+    //   token0 = L * (1/sqrtP - 1/sqrtUpper)
+    //   token1 = L * (sqrtP   - sqrtLower)
+    // Total value = token0 * P + token1 = L * (sqrtP - sqrtLower + P*(1/sqrtP - 1/sqrtUpper))
+    //                                   = L * (sqrtP - sqrtLower + sqrtP - P/sqrtUpper)
+    //                                   = L * (2*sqrtP - sqrtLower - P/sqrtUpper)
+    // So L = 1 / (2*sqrtEntry - sqrtLower - entryPrice/sqrtUpper)
+    const denom = 2 * sqrtEntry - sqrtLower - entryPrice / sqrtUpper
+    if (denom <= 0) return 1
+    const L = 1 / denom
 
     let token0Now: number
     let token1Now: number
 
     if (currentPrice <= priceLower) {
-      // All converted to token0
       token0Now = L * (1 / sqrtLower - 1 / sqrtUpper)
       token1Now = 0
     } else if (currentPrice >= priceUpper) {
-      // All converted to token1
       token0Now = 0
       token1Now = L * (sqrtUpper - sqrtLower)
     } else {
-      // In range — mixed
       token0Now = L * (1 / sqrtCurrent - 1 / sqrtUpper)
       token1Now = L * (sqrtCurrent - sqrtLower)
     }
 
-    const valueNow = token0Now * currentPrice + token1Now
-    const entryValue = token0Entry * entryPrice + token1Entry // = 1.0
-
-    return valueNow / entryValue
+    return token0Now * currentPrice + token1Now  // relative to $1 entry
   }
 }
