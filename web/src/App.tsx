@@ -143,7 +143,13 @@ export default function App() {
               <StatCard
                 label="Fees Earned (no rebalance)"
                 value={`$${fees.toFixed(4)}`}
-                sub={firstOpen ? `$${((fees / Math.max((Date.now() - firstOpen.opened_at) / 3_600_000, 1)) * 24).toFixed(4)}/day est.` : ''}
+                sub={firstOpen
+                  ? (() => {
+                      const ageHours = (Date.now() - firstOpen.opened_at) / 3_600_000
+                      if (ageHours < 1) return 'accumulating…'
+                      return `$${((fees / ageHours) * 24).toFixed(4)}/day est.`
+                    })()
+                  : ''}
                 color="green"
               />
               <StatCard
