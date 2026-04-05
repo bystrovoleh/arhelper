@@ -57,8 +57,13 @@ export class GeckoTerminalClient {
         apyBase: tvlUsd > 0 ? (feesUsd24h * 365 / tvlUsd) * 100 : 0,
         fetchedAt: Date.now(),
       }
-    } catch (err) {
-      console.warn(`GeckoTerminal: failed to fetch pool ${poolAddress}`, err)
+    } catch (err: any) {
+      const status = err?.response?.status
+      if (status === 429) {
+        console.warn(`GeckoTerminal: rate limited (429) for ${poolAddress.slice(0, 10)}…`)
+      } else {
+        console.warn(`GeckoTerminal: failed to fetch pool ${poolAddress}`, err?.message ?? err)
+      }
       return null
     }
   }
