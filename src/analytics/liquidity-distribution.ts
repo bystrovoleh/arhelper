@@ -29,9 +29,7 @@ export interface LiquidityBucket {
   tickUpper: number
   priceLower: number
   priceUpper: number
-  liquidityActive: bigint
-  // Relative share of total in-range liquidity (0–1)
-  share: number
+  share: number  // relative share of total in-range liquidity (0–1)
 }
 
 const FEE_TO_TICK_SPACING: Record<number, number> = {
@@ -165,16 +163,13 @@ export class LiquidityDistribution {
         tickUpper,
         priceLower: this.tickToPrice(tickLower, pool.token0.decimals, pool.token1.decimals),
         priceUpper: this.tickToPrice(tickUpper, pool.token0.decimals, pool.token1.decimals),
-        liquidityActive: liq,
-        share: 0, // filled below
+        share: Number(liq), // will be normalised below
       })
     }
 
-    // Normalise shares
-    const maxLiq = buckets.reduce((m, b) => b.liquidityActive > m ? b.liquidityActive : m, 0n)
-    if (maxLiq > 0n) {
-      buckets.forEach(b => { b.share = Number(b.liquidityActive * 10000n / maxLiq) / 10000 })
-    }
+    // Normalise shares to 0–1
+    const maxLiq = Math.max(...buckets.map(b => b.share), 1)
+    buckets.forEach(b => { b.share = b.share / maxLiq })
 
     return buckets
   }
@@ -196,7 +191,6 @@ export class LiquidityDistribution {
         tickLower, tickUpper,
         priceLower: this.tickToPrice(tickLower, pool.token0.decimals, pool.token1.decimals),
         priceUpper: this.tickToPrice(tickUpper, pool.token0.decimals, pool.token1.decimals),
-        liquidityActive: BigInt(Math.floor(share * 1e12)),
         share,
       })
     }
