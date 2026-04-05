@@ -134,14 +134,30 @@ export default function App() {
         {tab === 'overview' && (
           <>
             <div style={S.grid4}>
-              <StatCard label="Mode" value="Paper Trading" color="blue" />
-              <StatCard label="Open Positions" value={stats?.openPositions ?? '—'} />
+              <StatCard
+                label="Active Position"
+                value={firstOpen ? `${firstOpen.token0_symbol}/${firstOpen.token1_symbol}` : '—'}
+                sub={firstOpen ? `${Math.floor((Date.now() - firstOpen.opened_at) / 3_600_000)}h running` : 'No position'}
+                color="blue"
+              />
+              <StatCard
+                label="Fees Earned (no rebalance)"
+                value={`$${fees.toFixed(4)}`}
+                sub={firstOpen ? `$${((fees / Math.max((Date.now() - firstOpen.opened_at) / 3_600_000, 1)) * 24).toFixed(4)}/day est.` : ''}
+                color="green"
+              />
               <StatCard
                 label="Total P&L"
                 value={`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`}
+                sub={firstOpen ? (firstOpen.in_range ? '✓ In range' : '✗ Out of range') : ''}
                 color={pnl >= 0 ? 'green' : 'red'}
               />
-              <StatCard label="Fees Earned" value={`$${fees.toFixed(3)}`} color="green" />
+              <StatCard
+                label="IL"
+                value={firstOpen?.il_pct != null ? `${(firstOpen.il_pct as number).toFixed(3)}%` : '—'}
+                sub="vs holding"
+                color={firstOpen?.il_pct != null && (firstOpen.il_pct as number) < -1 ? 'red' : 'default'}
+              />
             </div>
 
             <div style={S.grid2}>

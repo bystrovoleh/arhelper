@@ -17,19 +17,31 @@ interface Position {
   in_range?: number
 }
 
-function RangeBar({ tickLower, tickUpper, currentTick }: { tickLower: number; tickUpper: number; currentTick: number }) {
+// WETH(18)/USDC(6): price = 1.0001^tick * 10^(18-6) = 1.0001^tick * 1e12
+const tickToPrice = (tick: number) => Math.pow(1.0001, tick) * 1e12
+
+function RangeBar({ tickLower, tickUpper, currentTick, currentPrice }: {
+  tickLower: number; tickUpper: number; currentTick: number; currentPrice?: number
+}) {
   const total = tickUpper - tickLower
   const pos = Math.max(0, Math.min(1, (currentTick - tickLower) / total))
   const inRange = currentTick >= tickLower && currentTick < tickUpper
+  const priceLower = tickToPrice(tickLower)
+  const priceUpper = tickToPrice(tickUpper)
 
   return (
     <div style={{ margin: '12px 0 4px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text2)', marginBottom: 4 }}>
-        <span>${Math.pow(1.0001, tickLower).toFixed(2)}</span>
-        <span style={{ color: inRange ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
-          {inRange ? 'IN RANGE' : 'OUT OF RANGE'}
-        </span>
-        <span>${Math.pow(1.0001, tickUpper).toFixed(2)}</span>
+        <span>${priceLower.toFixed(0)}</span>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1 }}>
+          <span style={{ color: inRange ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
+            {inRange ? 'IN RANGE' : 'OUT OF RANGE'}
+          </span>
+          {currentPrice && (
+            <span style={{ color: 'var(--blue)', fontSize: 10 }}>${currentPrice.toFixed(2)}</span>
+          )}
+        </div>
+        <span>${priceUpper.toFixed(0)}</span>
       </div>
       <div style={{ height: 6, background: 'var(--bg3)', borderRadius: 3, position: 'relative' }}>
         <div style={{
@@ -88,7 +100,7 @@ export function PositionCard({ pos }: { pos: Position }) {
       </div>
 
       {/* Range bar */}
-      <RangeBar tickLower={pos.tick_lower} tickUpper={pos.tick_upper} currentTick={currentTick} />
+      <RangeBar tickLower={pos.tick_lower} tickUpper={pos.tick_upper} currentTick={currentTick} currentPrice={pos.current_price} />
 
       {/* Stats row */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12, marginTop: 16 }}>
