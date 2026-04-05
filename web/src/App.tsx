@@ -155,7 +155,7 @@ export default function App() {
               <StatCard
                 label="Total P&L"
                 value={`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`}
-                sub={firstOpen ? (firstOpen.in_range ? '✓ In range' : '✗ Out of range') : ''}
+                sub={firstOpen ? (firstOpen.in_range == null ? '…' : firstOpen.in_range ? '✓ In range' : '✗ Out of range') : ''}
                 color={pnl >= 0 ? 'green' : 'red'}
               />
               <StatCard
