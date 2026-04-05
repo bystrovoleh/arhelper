@@ -45,7 +45,12 @@ export class LiquidityDistribution {
    *
    * Uses Multicall3 to batch all tick reads into 1–2 RPC calls.
    */
-  async fetch(pool: PoolConfig, currentTick: number): Promise<LiquidityBucket[]> {
+  async fetch(pool: PoolConfig, currentTick: number, forceOnChain = false): Promise<LiquidityBucket[]> {
+    // Aerodrome Slipstream uses a different tickBitmap layout than Uniswap v3
+    // Fall back to synthetic buckets for Aerodrome pools
+    if (pool.protocol === 'aerodrome' && !forceOnChain) {
+      return this.syntheticBuckets(currentTick, FEE_TO_TICK_SPACING[pool.feeTier] ?? 10, pool)
+    }
     const tickSpacing = FEE_TO_TICK_SPACING[pool.feeTier] ?? 10
     const provider = rpcClient.getProvider(pool.network)
 
@@ -55,9 +60,12 @@ export class LiquidityDistribution {
     const tickMin = Math.floor((currentTick - radiusTicks) / tickSpacing) * tickSpacing
     const tickMax = Math.ceil((currentTick + radiusTicks) / tickSpacing) * tickSpacing
 
-    // tickBitmap words to fetch: word = tick >> 8 (each word covers 256 ticks)
-    const wordMin = tickMin >> 8
-    const wordMax = tickMax >> 8
+    // tickBitmap uses compressed tick index: compressedTick = tick / tickSpacing
+    // word = compressedTick >> 8  (each word covers 256 compressed ticks)
+    const compressedMin = Math.floor(tickMin / tickSpacing)
+    const compressedMax = Math.ceil(tickMax / tickSpacing)
+    const wordMin = compressedMin >> 8
+    const wordMax = compressedMax >> 8
 
     const multicallAddr = '0xcA11bde05977b3631167028862bE2a173976CA11'
     const multicall = new Contract(multicallAddr, MULTICALL3_ABI, provider)
@@ -81,12 +89,17 @@ export class LiquidityDistribution {
       for (let wi = 0; wi < bitmapResults.length; wi++) {
         const result = bitmapResults[wi]!
         if (!result.success) continue
-        const word = BigInt(result.returnData)
+        // returnData may be 0x or short — parse safely
+        if (!result.returnData || result.returnData === '0x') continue
+        let word: bigint
+        try { word = BigInt(result.returnData) } catch { continue }
         if (word === 0n) continue
         const wordPos = wordMin + wi
         for (let bit = 0; bit < 256; bit++) {
           if ((word >> BigInt(bit)) & 1n) {
-            const tick = (wordPos * 256 + bit) * tickSpacing
+            // compressed index → real tick
+            const compressedTick = wordPos * 256 + bit
+            const tick = compressedTick * tickSpacing
             if (tick >= tickMin && tick <= tickMax) {
               initializedTicks.push(tick)
             }
