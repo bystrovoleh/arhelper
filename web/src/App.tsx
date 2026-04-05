@@ -10,7 +10,7 @@ import { RegimeCard } from './components/RegimeCard'
 import { LiquidityHeatmap } from './components/LiquidityHeatmap'
 import { InRangeStatsCard } from './components/InRangeStats'
 
-const POOL_ADDRESS = '0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59'
+const POOL_ADDRESS = '0xC6962004f452bE9203591991D15f6b388e09E8D0'
 
 type Tab = 'overview' | 'positions' | 'pools' | 'analytics' | 'log'
 

@@ -39,7 +39,7 @@ export const THEGRAPH = {
   get apiKey() { return requireEnv('THEGRAPH_API_KEY') },
   subgraphs: {
     'uniswap-v3-base': '43Hwfi3dJSoGpyas9VwNoDAv55yjgGrPpNSmbQZArzMG',
-    'uniswap-v3-arbitrum': 'FbCGRftH4a3yZugY7TnbYgPJVEv2LvMT6oF1fxPe9aJG',
+    'uniswap-v3-arbitrum': 'FQ6JYszEKApsBpAmiHesRsd9Ygc6mzmpNRANeVQFYoVX',
     'aerodrome-base': 'GENunSHWLBXm59mBSgPzQ8metBEp9YDfdqwFr91Av1UM',
   },
 }
@@ -48,12 +48,28 @@ export const THEGRAPH = {
 
 export const WATCHED_POOLS: PoolConfig[] = [
   {
-    address: '0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59', // Aerodrome WETH/USDC 0.05% — vol $90M/day
-    token0: { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH', decimals: 18 },
-    token1: { address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', symbol: 'USDC', decimals: 6 },
+    address: '0xC6962004f452bE9203591991D15f6b388e09E8D0', // Uniswap v3 WETH/USDC 0.05% — most liquid, ~$53M TVL
+    token0: { address: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', symbol: 'WETH', decimals: 18 },
+    token1: { address: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', symbol: 'USDC', decimals: 6 },
     feeTier: 500,
-    network: 'base',
-    protocol: 'aerodrome',
+    network: 'arbitrum',
+    protocol: 'uniswap-v3',
+  },
+  {
+    address: '0x0E4831319A50228B9e450861297aB92dee15B44F', // Uniswap v3 WBTC/USDC 0.05%
+    token0: { address: '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', symbol: 'WBTC', decimals: 8 },
+    token1: { address: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', symbol: 'USDC', decimals: 6 },
+    feeTier: 500,
+    network: 'arbitrum',
+    protocol: 'uniswap-v3',
+  },
+{
+    address: '0x2f5e87C9312fa29aed5c179e456625D79015299c', // Uniswap v3 WBTC/WETH 0.05%
+    token0: { address: '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', symbol: 'WBTC', decimals: 8 },
+    token1: { address: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', symbol: 'WETH', decimals: 18 },
+    feeTier: 500,
+    network: 'arbitrum',
+    protocol: 'uniswap-v3',
   },
 ]
 

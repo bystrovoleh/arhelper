@@ -5,20 +5,20 @@ import type { OhlcvCandle } from '../backtest/types'
 dotenv.config()
 
 // ─── The Graph Client ─────────────────────────────────────────────────────────
-// Fetches historical OHLCV data from Uniswap v3 Base subgraph.
-// Uniswap v3 is a close proxy for Aerodrome Slipstream prices (same pool, arb keeps them in sync).
+// Fetches historical OHLCV data from Uniswap v3 Arbitrum subgraph.
 //
-// Subgraph: Uniswap v3 Base
-// ID: FUbEPQw1oMghy39fwWBFY5fE6MXPXZQtjncQy2cXdrNS
+// Subgraph: Uniswap v3 Arbitrum
+// ID: FbCGRftH4a3yZugY7TnbYgPJVEv2LvMT6oF1fxPe9aJM
 // Entity: poolHourData — hourly OHLCV per pool
 
-// Uniswap v3 Base subgraph (has poolHourData with OHLCV)
-const SUBGRAPH_ID = '43Hwfi3dJSoGpyas9VwNoDAv55yjgGrPpNSmbQZArzMG'
+// Uniswap v3 Arbitrum subgraph (has poolHourData with OHLCV)
+// Verified working on The Graph Gateway (decentralized network)
+const SUBGRAPH_ID = 'FbCGRftH4a3yZugY7TnbYgPJVEv2LvMT6oF1fxPe9aJM'
 const GATEWAY = 'https://gateway.thegraph.com/api'
 
-// Uniswap v3 WETH/USDC 0.05% pool on Base
-// token0=USDC, token1=WETH → prices are USDC/WETH, must invert to get WETH/USDC
-const UNISWAP_WETH_USDC_BASE = '0xd0b53d9277642d899df5c87a3966a349a798f224'
+// Uniswap v3 WETH/USDC 0.05% pool on Arbitrum
+// token0=WETH, token1=USDC → prices are WETH/USDC, no inversion needed
+const UNISWAP_WETH_USDC_ARBITRUM = '0xc6962004f452be9203591991d15f6b388e09e8d0'
 
 export class TheGraphClient {
 
@@ -78,13 +78,14 @@ export class TheGraphClient {
     if (!rows || rows.length === 0) return []
 
     // Convert to OhlcvCandle [timestamp_ms, open, high, low, close, volume_usd]
-    // poolHourData prices are USDC/WETH (token0/token1), invert to get WETH price in USD
+    // poolHourData prices are token0/token1 = WETH/USDC ≈ 0.000489 (WETH per 1 USDC)
+    // Must invert to get ETH price in USD: 1/0.000489 ≈ $2045
+    // high price = 1/low_raw, low price = 1/high_raw (inverted)
     const candles: OhlcvCandle[] = rows
       .filter(r => parseFloat(r.close) > 0)
       .map(r => {
         const open  = 1 / parseFloat(r.open)
         const close = 1 / parseFloat(r.close)
-        // high price = low raw value, low price = high raw value (inverted)
         const high  = 1 / parseFloat(r.low)
         const low   = 1 / parseFloat(r.high)
         return [r.periodStartUnix * 1000, open, high, low, close, parseFloat(r.volumeUSD)]
@@ -138,9 +139,9 @@ export class TheGraphClient {
     return deduped
   }
 
-  // Convenience: fetch WETH/USDC candles on Base
+  // Convenience: fetch WETH/USDC candles on Arbitrum
   async fetchWethUsdcCandles(maxCandles = 5000): Promise<OhlcvCandle[]> {
-    return this.fetchAllHourlyCandles(UNISWAP_WETH_USDC_BASE, maxCandles)
+    return this.fetchAllHourlyCandles(UNISWAP_WETH_USDC_ARBITRUM, maxCandles)
   }
 }
 
