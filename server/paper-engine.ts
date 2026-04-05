@@ -5,6 +5,7 @@ import { apyCalculator } from '../src/analytics/apy-calculator'
 import { rebalanceTrigger } from '../src/strategy/rebalance-trigger'
 import { rangeCalculator } from '../src/strategy/range-calculator'
 import { poolRanker } from '../src/analytics/pool-ranker'
+import { calcLiquidity, calcFeesFromGrowth, feesToUsd } from '../src/analytics/fee-math'
 import { WATCHED_POOLS, STRATEGY } from '../src/config'
 import type { Position, PoolState } from '../src/types'
 
@@ -44,21 +45,30 @@ export class PaperEngine {
     const token0Amount = (capitalUsd / 2) / currentPrice
     const token1Amount = capitalUsd / 2
 
+    // Calculate real liquidity units from capital and price range
+    const decimalAdj = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
+    const priceLower = Math.pow(1.0001, range.tickLower) * decimalAdj
+    const priceUpper = Math.pow(1.0001, range.tickUpper) * decimalAdj
+    const liquidity = calcLiquidity(capitalUsd, currentPrice, priceLower, priceUpper, pool.token0.decimals, pool.token1.decimals)
+
     const tokenId = `paper-${Date.now()}`
 
     db.prepare(`
       INSERT INTO positions
         (token_id, pool_address, network, protocol, token0_symbol, token1_symbol,
          tick_lower, tick_upper, liquidity, token0_amount, token1_amount,
-         entry_price, entry_price_usd, opened_at, is_paper, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'open')
+         entry_price, entry_price_usd, opened_at, is_paper, status,
+         fee_growth_global0_entry, fee_growth_global1_entry)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)
     `).run(
       tokenId, pool.address, pool.network, pool.protocol,
       pool.token0.symbol, pool.token1.symbol,
-      range.tickLower, range.tickUpper, '0',
+      range.tickLower, range.tickUpper, liquidity.toString(),
       token0Amount, token1Amount,
       currentPrice, capitalUsd,
-      Date.now()
+      Date.now(),
+      state.feeGrowthGlobal0X128.toString(),
+      state.feeGrowthGlobal1X128.toString(),
     )
 
     logEvent('POSITION_OPENED', `Paper position opened: ${pool.token0.symbol}/${pool.token1.symbol} @ $${currentPrice.toFixed(2)}, range ${range.reason}`, {
@@ -86,9 +96,11 @@ export class PaperEngine {
         const currentPrice = state.token0Price
         const inRange = state.tick >= row.tick_lower && state.tick < row.tick_upper
 
-        // ── Simulate fee accrual ─────────────────────────────────────────────
-        // Fees accumulate only while in-range. Estimate based on pool volume.
-        const feesUsd = this.estimateAccruedFees(row, market, state, inRange)
+        // ── Real fee accrual via feeGrowthGlobal delta ───────────────────────
+        const feesUsd = inRange ? this.calcRealFees(row, state) : (
+          // Out of range: no new fees, keep last recorded value
+          (db.prepare(`SELECT COALESCE(MAX(fees_usd), 0) as total FROM position_snapshots WHERE token_id = ?`).get(row.token_id) as any).total
+        )
 
         // ── IL calculation ───────────────────────────────────────────────────
         const _decAdj = pool ? Math.pow(10, pool.token0.decimals - pool.token1.decimals) : 1e12
@@ -218,21 +230,29 @@ export class PaperEngine {
     db.prepare(`UPDATE positions SET status = 'rebalanced', closed_at = ? WHERE token_id = ?`)
       .run(Date.now(), row.token_id)
 
-    // Open new with same capital (simplified: use entry amount)
+    // Open new with same capital + real liquidity + new feeGrowthGlobal baseline
     const newTokenId = `paper-${Date.now()}`
+    const decimalAdj = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
+    const newPriceLower = Math.pow(1.0001, newRange.tickLower) * decimalAdj
+    const newPriceUpper = Math.pow(1.0001, newRange.tickUpper) * decimalAdj
+    const newLiquidity = calcLiquidity(row.entry_price_usd, currentPrice, newPriceLower, newPriceUpper, pool.token0.decimals, pool.token1.decimals)
+
     db.prepare(`
       INSERT INTO positions
         (token_id, pool_address, network, protocol, token0_symbol, token1_symbol,
          tick_lower, tick_upper, liquidity, token0_amount, token1_amount,
-         entry_price, entry_price_usd, opened_at, is_paper, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'open')
+         entry_price, entry_price_usd, opened_at, is_paper, status,
+         fee_growth_global0_entry, fee_growth_global1_entry)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)
     `).run(
       newTokenId, pool.address, pool.network, pool.protocol,
       pool.token0.symbol, pool.token1.symbol,
-      newRange.tickLower, newRange.tickUpper, '0',
+      newRange.tickLower, newRange.tickUpper, newLiquidity.toString(),
       row.token0_amount, row.token1_amount,
       currentPrice, row.entry_price_usd,
-      Date.now()
+      Date.now(),
+      state.feeGrowthGlobal0X128.toString(),
+      state.feeGrowthGlobal1X128.toString(),
     )
 
     logEvent('REBALANCE',
@@ -276,49 +296,40 @@ export class PaperEngine {
   // ── Fee simulation ─────────────────────────────────────────────────────────
   // Estimate fees accrued since last snapshot (or position open).
 
-  private estimateAccruedFees(row: any, market: any, state: PoolState, inRange: boolean): number {
-    if (!inRange || !market) return 0
+  private calcRealFees(row: any, state: PoolState): number {
+    // ── Real on-chain fee calculation ─────────────────────────────────────────
+    // Uses feeGrowthGlobal delta × liquidity / 2^128
+    // This is the exact same formula Uniswap uses internally.
 
-    // Get fees already recorded so we never go backwards
-    const existing = db.prepare(
-      `SELECT COALESCE(MAX(fees_usd), 0) as total FROM position_snapshots WHERE token_id = ?`
-    ).get(row.token_id) as any
-    const existingFeesUsd: number = existing.total
+    if (!row.fee_growth_global0_entry || !row.fee_growth_global1_entry) return 0
+    if (!row.liquidity || row.liquidity === '0') return 0
 
-    // ── Honest fee estimate ────────────────────────────────────────────────────
-    // Real formula: fees = poolFees24h × (myLiquidity / totalLiquidity)
-    //
-    // Since this is paper trading we don't have real liquidity units.
-    // Best proxy: positionShare = capital / TVL (assumes uniform distribution).
-    // This is CONSERVATIVE because concentrated positions earn more per dollar,
-    // but the concentration factor varies by how much of TVL is also concentrated.
-    //
-    // We compute concentration factor from the actual tick range stored in DB:
-    //   concentrationFactor = sqrt(upperPrice) * sqrt(lowerPrice) / (sqrt(currentPrice) * (sqrt(upperPrice) - sqrt(lowerPrice)))
-    // Then cap it at 20× to avoid unrealistic estimates.
+    try {
+      const liquidity = BigInt(row.liquidity)
+      const fg0Entry = BigInt(row.fee_growth_global0_entry)
+      const fg1Entry = BigInt(row.fee_growth_global1_entry)
+      const fg0Now = state.feeGrowthGlobal0X128
+      const fg1Now = state.feeGrowthGlobal1X128
 
-    const pool = WATCHED_POOLS.find(p => p.address === row.pool_address)
-    const decimalAdj = pool ? Math.pow(10, pool.token0.decimals - pool.token1.decimals) : 1e12
-    const priceLower = Math.pow(1.0001, row.tick_lower) * decimalAdj
-    const priceUpper = Math.pow(1.0001, row.tick_upper) * decimalAdj
-    const currentPrice = state.token0Price
+      const fees0Raw = calcFeesFromGrowth(fg0Entry, fg0Now, liquidity)
+      const fees1Raw = calcFeesFromGrowth(fg1Entry, fg1Now, liquidity)
 
-    let concentrationFactor = 1
-    if (currentPrice > priceLower && currentPrice < priceUpper) {
-      const sqrtU = Math.sqrt(priceUpper)
-      const sqrtL = Math.sqrt(priceLower)
-      const sqrtC = Math.sqrt(currentPrice)
-      const denom = sqrtC * (sqrtU - sqrtL)
-      if (denom > 0) {
-        concentrationFactor = Math.min((sqrtU * sqrtL) / denom, 20) // cap at 20×
-      }
+      const pool = WATCHED_POOLS.find(p => p.address === row.pool_address)
+      const t0dec = pool?.token0.decimals ?? 18
+      const t1dec = pool?.token1.decimals ?? 6
+
+      const feesUsd = feesToUsd(fees0Raw, fees1Raw, t0dec, t1dec, state.token0Price)
+
+      // Never go backwards (snapshots can be out of order)
+      const existing = db.prepare(
+        `SELECT COALESCE(MAX(fees_usd), 0) as total FROM position_snapshots WHERE token_id = ?`
+      ).get(row.token_id) as any
+
+      return Math.max(feesUsd, existing.total as number)
+    } catch (err) {
+      console.warn('[fees] real fee calc failed:', err)
+      return 0
     }
-
-    const secondsOpen = (Date.now() - row.opened_at) / 1000
-    const positionShare = market.tvlUsd > 0 ? row.entry_price_usd / market.tvlUsd : 0
-    const totalEstimatedFees = (market.feesUsd24h / 86400) * secondsOpen * positionShare * concentrationFactor
-
-    return Math.max(totalEstimatedFees, existingFeesUsd)
   }
 }
 

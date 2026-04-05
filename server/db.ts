@@ -28,7 +28,10 @@ db.exec(`
     opened_at INTEGER NOT NULL,
     closed_at INTEGER,
     is_paper INTEGER NOT NULL DEFAULT 1,
-    status TEXT NOT NULL DEFAULT 'open'   -- open | closed | rebalanced
+    status TEXT NOT NULL DEFAULT 'open',  -- open | closed | rebalanced
+    -- On-chain fee tracking (real data)
+    fee_growth_global0_entry TEXT,  -- feeGrowthGlobal0X128 at position open
+    fee_growth_global1_entry TEXT   -- feeGrowthGlobal1X128 at position open
   );
 
   CREATE TABLE IF NOT EXISTS position_snapshots (
@@ -70,6 +73,16 @@ db.exec(`
     estimated_concentrated_apy REAL
   );
 `)
+
+// ─── Migrations ───────────────────────────────────────────────────────────────
+// Add new columns to existing DBs safely
+const existingCols = (db.prepare(`PRAGMA table_info(positions)`).all() as any[]).map(c => c.name)
+if (!existingCols.includes('fee_growth_global0_entry')) {
+  db.exec(`ALTER TABLE positions ADD COLUMN fee_growth_global0_entry TEXT`)
+}
+if (!existingCols.includes('fee_growth_global1_entry')) {
+  db.exec(`ALTER TABLE positions ADD COLUMN fee_growth_global1_entry TEXT`)
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

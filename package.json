@@ -8,7 +8,8 @@
     "server:watch": "nodemon --watch src --watch server --ext ts --exec ts-node server/index.ts",
     "web": "cd web && npm run dev",
     "dev": "concurrently -n server,web -c cyan,magenta \"npm run server:watch\" \"npm run web\"",
-    "build": "tsc"
+    "build": "tsc",
+    "backtest": "ts-node src/backtest/run.ts"
   },
   "keywords": [],
   "author": "",

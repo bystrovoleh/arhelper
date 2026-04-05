@@ -86,9 +86,23 @@ export class GeckoTerminalClient {
         { params: { limit } }
       )
       return data.data?.attributes?.ohlcv_list as Array<[number, number, number, number, number, number]> ?? []
-      // Each entry: [timestamp, open, high, low, close, volume]
     } catch (err) {
       console.warn(`GeckoTerminal: failed to fetch OHLCV for ${poolAddress}`, err)
+      return []
+    }
+  }
+
+  // Fetch older candles before a given timestamp (for pagination)
+  async fetchOhlcvBefore(poolAddress: string, network: string, timeframe: 'minute' | 'hour' | 'day', limit: number, beforeTimestamp: number) {
+    const networkSlug = this.networkMap[network] ?? network
+    try {
+      const { data } = await this.client.get(
+        `/networks/${networkSlug}/pools/${poolAddress}/ohlcv/${timeframe}`,
+        { params: { limit, before_timestamp: Math.floor(beforeTimestamp / 1000) } }
+      )
+      return data.data?.attributes?.ohlcv_list as Array<[number, number, number, number, number, number]> ?? []
+    } catch (err) {
+      console.warn(`GeckoTerminal: failed to fetch older OHLCV for ${poolAddress}`, err)
       return []
     }
   }
