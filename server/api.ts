@@ -22,10 +22,23 @@ app.get('/api/positions', (_req, res) => {
   const positions = db.prepare(`
     SELECT p.*,
       s.current_price, s.fees_usd, s.il_pct, s.pnl_usd, s.in_range,
-      s.recorded_at as last_snapshot_at
+      s.token0_amount as current_token0_amount,
+      s.token1_amount as current_token1_amount,
+      s.recorded_at as last_snapshot_at,
+      COALESCE(sw.total_swap_costs, 0) as swap_costs_usd,
+      COALESCE(sw.total_gas_costs, 0)  as gas_costs_usd,
+      COALESCE(sw.swap_count, 0)       as swap_count
     FROM positions p
     LEFT JOIN position_snapshots s ON s.token_id = p.token_id
       AND s.id = (SELECT MAX(id) FROM position_snapshots WHERE token_id = p.token_id)
+    LEFT JOIN (
+      SELECT token_id,
+        SUM(CASE WHEN token_in != 'GAS' THEN amount_in_usd - amount_out_usd ELSE 0 END) as total_swap_costs,
+        SUM(gas_usd) as total_gas_costs,
+        COUNT(CASE WHEN token_in != 'GAS' THEN 1 END) as swap_count
+      FROM swap_events
+      GROUP BY token_id
+    ) sw ON sw.token_id = p.token_id
     ORDER BY p.opened_at DESC
   `).all()
   res.json(positions)
@@ -70,6 +83,14 @@ app.get('/api/positions/:tokenId', (req, res) => {
   `).all(req.params['tokenId'])
 
   res.json({ position, snapshots })
+})
+
+// Swap history for a position
+app.get('/api/positions/:tokenId/swaps', (req, res) => {
+  const swaps = db.prepare(`
+    SELECT * FROM swap_events WHERE token_id = ? ORDER BY occurred_at ASC
+  `).all(req.params['tokenId'])
+  res.json(swaps)
 })
 
 // ─── Events / Log ─────────────────────────────────────────────────────────────
@@ -141,10 +162,20 @@ app.get('/api/stats', (_req, res) => {
   const rebalances = (db.prepare(`SELECT COUNT(*) as c FROM positions WHERE status = 'rebalanced'`).get() as any).c
 
   const pnl = db.prepare(`
-    SELECT COALESCE(SUM(s.pnl_usd), 0) as total_pnl, COALESCE(SUM(s.fees_usd), 0) as total_fees
+    SELECT
+      COALESCE(SUM(s.pnl_usd), 0) as total_pnl,
+      COALESCE(SUM(s.fees_usd), 0) as total_fees,
+      COALESCE(SUM(sw.total_swap_costs), 0) as total_swap_costs,
+      COALESCE(SUM(sw.total_gas_costs), 0) as total_gas_costs
     FROM positions p
     JOIN position_snapshots s ON s.token_id = p.token_id
       AND s.id = (SELECT MAX(id) FROM position_snapshots WHERE token_id = p.token_id)
+    LEFT JOIN (
+      SELECT token_id,
+        SUM(CASE WHEN token_in != 'GAS' THEN amount_in_usd - amount_out_usd ELSE 0 END) as total_swap_costs,
+        SUM(gas_usd) as total_gas_costs
+      FROM swap_events GROUP BY token_id
+    ) sw ON sw.token_id = p.token_id
     WHERE p.status = 'open'
   `).get() as any
 
@@ -154,7 +185,10 @@ app.get('/api/stats', (_req, res) => {
     rebalances,
     totalPnlUsd: pnl.total_pnl,
     totalFeesUsd: pnl.total_fees,
-    mode: 'paper',
+    totalSwapCostsUsd: pnl.total_swap_costs,
+    totalGasCostsUsd: pnl.total_gas_costs,
+    netPnlUsd: pnl.total_pnl - pnl.total_swap_costs - pnl.total_gas_costs,
+    mode: LIVE ? 'live' : 'paper',
   })
 })
 

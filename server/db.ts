@@ -72,6 +72,19 @@ db.exec(`
     apy_base REAL,
     estimated_concentrated_apy REAL
   );
+
+  CREATE TABLE IF NOT EXISTS swap_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id         TEXT NOT NULL,
+    tx_hash          TEXT NOT NULL,
+    token_in         TEXT NOT NULL,
+    amount_in_usd    REAL NOT NULL,
+    token_out        TEXT NOT NULL,
+    amount_out_usd   REAL NOT NULL,
+    price_impact_pct REAL NOT NULL,
+    gas_usd          REAL NOT NULL,
+    occurred_at      INTEGER NOT NULL
+  );
 `)
 
 // ─── Migrations ───────────────────────────────────────────────────────────────

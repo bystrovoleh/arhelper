@@ -20,6 +20,11 @@ interface Position {
   in_range?: number
   token0_amount?: number
   token1_amount?: number
+  current_token0_amount?: number
+  current_token1_amount?: number
+  swap_costs_usd?: number
+  gas_costs_usd?: number
+  swap_count?: number
 }
 
 const tickToPrice = (tick: number) => Math.pow(1.0001, tick) * 1e12
@@ -93,6 +98,9 @@ export function PositionCard({ pos }: { pos: Position }) {
   const pnl = pos.pnl_usd ?? 0
   const fees = pos.fees_usd ?? 0
   const il = pos.il_pct ?? 0
+  const swapCosts = pos.swap_costs_usd ?? 0
+  const gasCosts = pos.gas_costs_usd ?? 0
+  const netPnl = pnl - swapCosts - gasCosts
   const ageMs = Date.now() - pos.opened_at
   const ageHours = ageMs / 3_600_000
   const ageDays = Math.floor(ageHours / 24)
@@ -187,15 +195,45 @@ export function PositionCard({ pos }: { pos: Position }) {
         currentPrice={pos.current_price}
       />
 
-      {/* Stats grid */}
+      {/* Stats grid — row 1: P&L breakdown */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginTop: 16 }}>
         {[
           {
             label: 'Fees Earned',
-            value: `$${fees.toFixed(4)}`,
+            value: `+$${fees.toFixed(4)}`,
             sub: feesPerDay != null ? `$${feesPerDay.toFixed(4)}/day` : 'accumulating…',
             color: 'var(--green)',
           },
+          {
+            label: 'Swap Costs',
+            value: swapCosts > 0 ? `-$${swapCosts.toFixed(4)}` : '$0',
+            sub: pos.swap_count ? `${pos.swap_count} swap${pos.swap_count > 1 ? 's' : ''}` : 'no swaps',
+            color: swapCosts > 0 ? 'var(--red)' : 'var(--text2)',
+          },
+          {
+            label: 'Gas Costs',
+            value: gasCosts > 0 ? `-$${gasCosts.toFixed(4)}` : '$0',
+            sub: 'tx fees',
+            color: 'var(--text2)',
+          },
+          {
+            label: 'Net P&L',
+            value: `${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(4)}`,
+            sub: 'after all costs',
+            color: netPnl >= 0 ? 'var(--green)' : 'var(--red)',
+          },
+        ].map(s => (
+          <div key={s.label} style={{ background: 'var(--bg3)', borderRadius: 8, padding: '10px 12px' }}>
+            <div style={{ color: 'var(--text2)', fontSize: 11, marginBottom: 4 }}>{s.label}</div>
+            <div style={{ fontWeight: 600, color: s.color, fontSize: 14 }}>{s.value}</div>
+            {s.sub && <div style={{ color: 'var(--text2)', fontSize: 10, marginTop: 2 }}>{s.sub}</div>}
+          </div>
+        ))}
+      </div>
+
+      {/* Stats grid — row 2: position metrics */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginTop: 10 }}>
+        {[
           {
             label: 'Fees %',
             value: `${feesPct.toFixed(3)}%`,
@@ -214,45 +252,6 @@ export function PositionCard({ pos }: { pos: Position }) {
             sub: `entry $${pos.entry_price.toFixed(0)}`,
             color: priceChangeFromEntry != null && priceChangeFromEntry >= 0 ? 'var(--green)' : 'var(--red)',
           },
-        ].map(s => (
-          <div key={s.label} style={{ background: 'var(--bg3)', borderRadius: 8, padding: '10px 12px' }}>
-            <div style={{ color: 'var(--text2)', fontSize: 11, marginBottom: 4 }}>{s.label}</div>
-            <div style={{ fontWeight: 600, color: s.color, fontSize: 14 }}>{s.value}</div>
-            {s.sub && <div style={{ color: 'var(--text2)', fontSize: 10, marginTop: 2 }}>{s.sub}</div>}
-          </div>
-        ))}
-      </div>
-
-      {/* Second stats row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginTop: 10 }}>
-        {[
-          {
-            label: 'Position Value',
-            value: pos.current_price
-              ? `$${((pos.token0_amount ?? 0) * pos.current_price + (pos.token1_amount ?? 0) + fees).toFixed(2)}`
-              : '—',
-            sub: `entry $${pos.entry_price_usd.toFixed(2)}`,
-            color: 'var(--text)',
-          },
-          {
-            label: 'Composition',
-            value: pos.current_price && pos.token0_amount != null && pos.token1_amount != null
-              ? (() => {
-                  const v0 = pos.token0_amount * pos.current_price
-                  const v1 = pos.token1_amount
-                  const total = v0 + v1
-                  return total > 0 ? `${(v0/total*100).toFixed(0)}% / ${(v1/total*100).toFixed(0)}%` : '—'
-                })()
-              : '—',
-            sub: `${pos.token0_symbol} / ${pos.token1_symbol}`,
-            color: 'var(--text2)',
-          },
-          {
-            label: 'Range Width',
-            value: `±${((priceUpper / priceLower - 1) * 50 * 100).toFixed(1)}%`,
-            sub: `$${priceLower.toFixed(0)} – $${priceUpper.toFixed(0)}`,
-            color: 'var(--text2)',
-          },
           {
             label: 'APY Est.',
             value: ageHours > 1 && fees > 0 && pos.entry_price_usd > 0
@@ -270,15 +269,63 @@ export function PositionCard({ pos }: { pos: Position }) {
         ))}
       </div>
 
-      {/* Range info row */}
+      {/* Third stats row: position value / composition / range */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginTop: 10 }}>
+        {[
+          {
+            label: 'Position Value',
+            value: pos.current_price
+              ? `$${((pos.current_token0_amount ?? pos.token0_amount ?? 0) * pos.current_price + (pos.current_token1_amount ?? pos.token1_amount ?? 0) + fees).toFixed(2)}`
+              : '—',
+            sub: `entry $${pos.entry_price_usd.toFixed(2)}`,
+            color: 'var(--text)',
+          },
+          {
+            label: 'Composition',
+            value: (() => {
+              const t0 = pos.current_token0_amount ?? pos.token0_amount
+              const t1 = pos.current_token1_amount ?? pos.token1_amount
+              if (!pos.current_price || t0 == null || t1 == null) return '—'
+              const v0 = t0 * pos.current_price
+              const v1 = t1
+              const total = v0 + v1
+              return total > 0 ? `${(v0/total*100).toFixed(0)}% / ${(v1/total*100).toFixed(0)}%` : '—'
+            })(),
+            sub: `${pos.token0_symbol} / ${pos.token1_symbol}`,
+            color: 'var(--text2)',
+          },
+          {
+            label: 'Range Width',
+            value: `±${((priceUpper / priceLower - 1) * 50 * 100).toFixed(1)}%`,
+            sub: `$${priceLower.toFixed(0)} – $${priceUpper.toFixed(0)}`,
+            color: 'var(--text2)',
+          },
+          {
+            label: 'Gross P&L',
+            value: `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`,
+            sub: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% on capital`,
+            color: pnl >= 0 ? 'var(--green)' : 'var(--red)',
+          },
+        ].map(s => (
+          <div key={s.label} style={{ background: 'var(--bg3)', borderRadius: 8, padding: '10px 12px' }}>
+            <div style={{ color: 'var(--text2)', fontSize: 11, marginBottom: 4 }}>{s.label}</div>
+            <div style={{ fontWeight: 600, color: s.color, fontSize: 14 }}>{s.value}</div>
+            {s.sub && <div style={{ color: 'var(--text2)', fontSize: 10, marginTop: 2 }}>{s.sub}</div>}
+          </div>
+        ))}
+      </div>
+
+      {/* P&L breakdown + Range info */}
       <div style={{
         display: 'flex', gap: 16, marginTop: 12, padding: '10px 12px',
-        background: 'var(--bg3)', borderRadius: 8, fontSize: 12,
+        background: 'var(--bg3)', borderRadius: 8, fontSize: 12, flexWrap: 'wrap',
       }}>
-        <span style={{ color: 'var(--text2)' }}>Capital: <span style={{ color: 'var(--text)', fontWeight: 600 }}>${pos.entry_price_usd.toFixed(0)}</span></span>
-        <span style={{ color: 'var(--text2)' }}>Range: <span style={{ color: 'var(--text)', fontWeight: 600 }}>${priceLower.toFixed(0)} – ${priceUpper.toFixed(0)}</span></span>
-        <span style={{ color: 'var(--text2)' }}>Width: <span style={{ color: 'var(--text)', fontWeight: 600 }}>{((priceUpper / priceLower - 1) * 100).toFixed(1)}%</span></span>
-        <span style={{ color: 'var(--text2)', marginLeft: 'auto', fontSize: 11 }}>ID: {pos.token_id}</span>
+        <span style={{ color: 'var(--text2)' }}>Fees: <span style={{ color: 'var(--green)', fontWeight: 600 }}>+${fees.toFixed(4)}</span></span>
+        <span style={{ color: 'var(--text2)' }}>Swaps: <span style={{ color: swapCosts > 0 ? 'var(--red)' : 'var(--text2)', fontWeight: 600 }}>-${swapCosts.toFixed(4)}</span></span>
+        <span style={{ color: 'var(--text2)' }}>Gas: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>-${gasCosts.toFixed(4)}</span></span>
+        <span style={{ color: 'var(--text2)' }}>Net: <span style={{ color: netPnl >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>{netPnl >= 0 ? '+' : ''}${netPnl.toFixed(4)}</span></span>
+        <span style={{ color: 'var(--text2)', marginLeft: 'auto' }}>Capital: <span style={{ color: 'var(--text)', fontWeight: 600 }}>${pos.entry_price_usd.toFixed(0)}</span></span>
+        <span style={{ color: 'var(--text2)' }}>ID: <span style={{ color: 'var(--text)', fontWeight: 600 }}>{pos.token_id}</span></span>
       </div>
     </div>
   )

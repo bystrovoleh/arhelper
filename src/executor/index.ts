@@ -1,14 +1,14 @@
-import { ethers, Contract, Wallet } from 'ethers'
+import { ethers, Contract, Wallet, TransactionReceipt } from 'ethers'
 import {
   Pool,
   Position as UniPosition,
   NonfungiblePositionManager,
-  nearestUsableTick,
 } from '@uniswap/v3-sdk'
 import { Token as UniToken, CurrencyAmount, Percent } from '@uniswap/sdk-core'
 import { rpcClient } from '../data-layer'
 import { PoolConfig, RangeRecommendation, Network } from '../types'
 import { NETWORKS, WALLET } from '../config'
+import { calcOptimalRatio } from './ratio-calculator'
 
 // ─── ABIs ─────────────────────────────────────────────────────────────────────
 
@@ -16,6 +16,12 @@ const ERC20_ABI = [
   'function approve(address spender, uint256 amount) external returns (bool)',
   'function allowance(address owner, address spender) external view returns (uint256)',
   'function balanceOf(address account) external view returns (uint256)',
+]
+
+const WETH_ABI = [
+  ...ERC20_ABI,
+  'function deposit() external payable',
+  'function withdraw(uint256 wad) external',
 ]
 
 const POOL_STATE_ABI = [
@@ -30,6 +36,24 @@ const SWAP_ROUTER_ABI = [
   'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
 ]
 
+// ETH to keep as gas reserve on Arbitrum (0.003 ETH ~ $6 at $2000)
+const GAS_RESERVE_ETH = 0.003
+
+// Minimum imbalance (fraction of total capital) that justifies a swap
+const SWAP_THRESHOLD = 0.05  // 5%
+
+// ─── Swap metadata returned to caller for P&L tracking ───────────────────────
+
+export interface SwapMeta {
+  txHash: string
+  tokenIn: string
+  tokenOut: string
+  amountInUsd: number
+  amountOutUsd: number
+  priceImpactPct: number
+  gasUsd: number
+}
+
 // ─── Executor ─────────────────────────────────────────────────────────────────
 
 export class Executor {
@@ -38,47 +62,131 @@ export class Executor {
     return new Wallet(WALLET.privateKey, provider)
   }
 
-  /**
-   * Swap 50% of token1 (USDC) to token0 (WETH) so we have both tokens for mint.
-   * Uses Uniswap v3 SwapRouter02 exactInputSingle with 1% slippage.
-   */
-  async swapHalfToToken0(pool: PoolConfig, token1AmountRaw: bigint): Promise<void> {
+  // ── Wrap native ETH → WETH, keeping GAS_RESERVE_ETH for gas ───────────────
+  async wrapEthIfNeeded(pool: PoolConfig): Promise<void> {
     const wallet = this.getWallet(pool.network)
-    const halfAmount = token1AmountRaw / 2n
-
-    console.log(`[Swap] Swapping ${halfAmount} raw ${pool.token1.symbol} → ${pool.token0.symbol}…`)
-
-    // Approve SwapRouter for token1
-    await this.ensureApprovalFor(pool.token1.address, halfAmount, SWAP_ROUTER, pool.network)
-
-    // Estimate minimum output with 1% slippage using current pool price
     const provider = rpcClient.getProvider(pool.network)
-    const poolContract = new Contract(pool.address, POOL_STATE_ABI, provider)
-    const slot0 = await poolContract.slot0()
-    const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96.toString())
-    const Q96 = 2n ** 96n
-    const decAdj = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
-    const sqrtPrice = Number(sqrtPriceX96) / Number(Q96)
-    const currentPrice = sqrtPrice * sqrtPrice * decAdj // token0 per token1 (e.g. WETH per USDC)
-    // halfAmount is in token1 raw units; expected token0 out = halfAmount / 10^decimals1 * (1/price)
-    const expectedToken0 = (Number(halfAmount) / Math.pow(10, pool.token1.decimals)) / currentPrice
-    const minOut = BigInt(Math.floor(expectedToken0 * Math.pow(10, pool.token0.decimals) * 0.99)) // 1% slippage
+
+    const ethBalance = await provider.getBalance(wallet.address)
+    const reserveWei = BigInt(Math.floor(GAS_RESERVE_ETH * 1e18))
+    const wrapAmount = ethBalance - reserveWei
+
+    if (wrapAmount <= 0n) {
+      console.log(`[Wrap] ETH balance ${ethers.formatEther(ethBalance)} ETH — below reserve, skipping wrap`)
+      return
+    }
+
+    const wethAmount = Number(wrapAmount) / 1e18
+    console.log(`[Wrap] Wrapping ${wethAmount.toFixed(6)} ETH → WETH (keeping ${GAS_RESERVE_ETH} ETH for gas)`)
+
+    const weth = new Contract(pool.token0.address, WETH_ABI, wallet)
+    const tx = await weth.deposit({ value: wrapAmount })
+    console.log(`[Wrap] Wrap tx submitted: ${tx.hash}`)
+    const receipt = await tx.wait()
+    if (!receipt || receipt.status !== 1) throw new Error(`Wrap tx failed: ${tx.hash}`)
+    console.log(`[Wrap] ✅ Wrapped ${wethAmount.toFixed(6)} ETH → WETH. tx: ${tx.hash}`)
+  }
+
+  // ── Generic exact-input swap with slippage protection ──────────────────────
+  private async swapExact(
+    pool: PoolConfig,
+    tokenIn: { address: string; decimals: number; symbol: string },
+    tokenOut: { address: string; decimals: number; symbol: string },
+    amountInRaw: bigint,
+    token0PriceUsd: number,
+  ): Promise<{ receipt: TransactionReceipt; amountOut: bigint }> {
+    const wallet = this.getWallet(pool.network)
+
+    // Calculate min output with 1% slippage
+    let expectedOut: number
+    if (tokenIn.address.toLowerCase() === pool.token1.address.toLowerCase()) {
+      // token1 → token0: amountIn (USDC) / price = WETH out
+      expectedOut = (Number(amountInRaw) / Math.pow(10, tokenIn.decimals)) / token0PriceUsd
+    } else {
+      // token0 → token1: amountIn (WETH) * price = USDC out
+      expectedOut = (Number(amountInRaw) / Math.pow(10, tokenIn.decimals)) * token0PriceUsd
+    }
+    const minOut = BigInt(Math.floor(expectedOut * Math.pow(10, tokenOut.decimals) * 0.99))
+
+    console.log(`[Swap] ${tokenIn.symbol} → ${tokenOut.symbol}`)
+    console.log(`[Swap]   Amount in:  ${(Number(amountInRaw) / Math.pow(10, tokenIn.decimals)).toFixed(6)} ${tokenIn.symbol}`)
+    console.log(`[Swap]   Expected:   ${expectedOut.toFixed(6)} ${tokenOut.symbol}`)
+    console.log(`[Swap]   Min out:    ${(Number(minOut) / Math.pow(10, tokenOut.decimals)).toFixed(6)} ${tokenOut.symbol} (1% slippage)`)
+
+    await this.ensureApprovalFor(tokenIn.address, amountInRaw, SWAP_ROUTER, pool.network)
 
     const router = new Contract(SWAP_ROUTER, SWAP_ROUTER_ABI, wallet)
     const tx = await router.exactInputSingle({
-      tokenIn: pool.token1.address,
-      tokenOut: pool.token0.address,
+      tokenIn: tokenIn.address,
+      tokenOut: tokenOut.address,
       fee: pool.feeTier,
       recipient: wallet.address,
-      amountIn: halfAmount,
+      amountIn: amountInRaw,
       amountOutMinimum: minOut,
       sqrtPriceLimitX96: 0n,
     })
 
-    console.log(`[Swap] Swap tx submitted: ${tx.hash}`)
+    console.log(`[Swap] Tx submitted: ${tx.hash}`)
     const receipt = await tx.wait()
     if (!receipt || receipt.status !== 1) throw new Error(`Swap tx failed: ${tx.hash}`)
-    console.log(`[Swap] Swap confirmed: ${tx.hash}`)
+
+    // Parse actual amount out from Swap event
+    let amountOut = minOut
+    try {
+      const swapTopic = ethers.id('Swap(address,address,int256,int256,uint160,uint128,int24)')
+      const swapLog = receipt.logs.find(l => l.topics[0] === swapTopic)
+      if (swapLog) {
+        const decoded = ethers.AbiCoder.defaultAbiCoder().decode(
+          ['int256', 'int256', 'uint160', 'uint128', 'int24'], swapLog.data
+        )
+        // amount0 and amount1 are signed — positive = tokens entering pool, negative = leaving
+        const [amount0, amount1] = decoded
+        const outIsToken0 = tokenOut.address.toLowerCase() === pool.token0.address.toLowerCase()
+        const rawOut = outIsToken0 ? -amount0 : -amount1
+        if (rawOut > 0n) amountOut = rawOut
+      }
+    } catch { /* fallback to minOut */ }
+
+    const amountOutHuman = Number(amountOut) / Math.pow(10, tokenOut.decimals)
+    console.log(`[Swap] ✅ Received: ${amountOutHuman.toFixed(6)} ${tokenOut.symbol} | tx: ${tx.hash}`)
+
+    return { receipt, amountOut }
+  }
+
+  // ── Build SwapMeta for P&L tracking ───────────────────────────────────────
+  private buildSwapMeta(
+    receipt: TransactionReceipt,
+    tokenIn: { symbol: string; decimals: number },
+    tokenOut: { symbol: string; decimals: number },
+    amountInRaw: bigint,
+    amountOutRaw: bigint,
+    token0PriceUsd: number,
+    isToken0In: boolean,
+  ): SwapMeta {
+    const amountInHuman = Number(amountInRaw) / Math.pow(10, tokenIn.decimals)
+    const amountOutHuman = Number(amountOutRaw) / Math.pow(10, tokenOut.decimals)
+
+    const amountInUsd  = isToken0In ? amountInHuman * token0PriceUsd : amountInHuman
+    const amountOutUsd = isToken0In ? amountOutHuman : amountOutHuman * token0PriceUsd
+
+    const priceImpactPct = amountInUsd > 0
+      ? ((amountInUsd - amountOutUsd) / amountInUsd) * 100
+      : 0
+
+    const gasEth = Number(receipt.gasUsed * (receipt as any).gasPrice) / 1e18
+    const gasUsd = gasEth * token0PriceUsd
+
+    console.log(`[Swap] P&L impact: in=$${amountInUsd.toFixed(4)} out=$${amountOutUsd.toFixed(4)} slippage=${priceImpactPct.toFixed(3)}% gas=$${gasUsd.toFixed(5)}`)
+
+    return {
+      txHash: receipt.hash,
+      tokenIn: tokenIn.symbol,
+      tokenOut: tokenOut.symbol,
+      amountInUsd,
+      amountOutUsd,
+      priceImpactPct,
+      gasUsd,
+    }
   }
 
   /**
@@ -89,126 +197,173 @@ export class Executor {
     const token = new Contract(tokenAddress, ERC20_ABI, wallet)
     const allowance: bigint = await token.allowance(wallet.address, spender)
     if (allowance >= amount) return
-    console.log(`Approving ${tokenAddress} for ${spender}…`)
+    console.log(`[Approve] ${tokenAddress.slice(0, 10)}… for ${spender.slice(0, 10)}…`)
     const tx = await token.approve(spender, ethers.MaxUint256)
     await tx.wait()
-    console.log(`Approval confirmed: ${tx.hash}`)
+    console.log(`[Approve] ✅ Confirmed: ${tx.hash}`)
   }
 
   /**
    * Approve the NonfungiblePositionManager to spend tokens.
-   * Only sends tx if allowance is insufficient.
    */
   async ensureApproval(tokenAddress: string, amount: bigint, network: Network): Promise<void> {
     const wallet = this.getWallet(network)
     const nfpm = NETWORKS[network]!.nonfungiblePositionManager
     const token = new Contract(tokenAddress, ERC20_ABI, wallet)
-
     const allowance: bigint = await token.allowance(wallet.address, nfpm)
     if (allowance >= amount) return
-
-    console.log(`Approving ${tokenAddress} for ${nfpm}…`)
+    console.log(`[Approve] ${tokenAddress.slice(0, 10)}… for NFPM`)
     const tx = await token.approve(nfpm, ethers.MaxUint256)
     await tx.wait()
-    console.log(`Approval confirmed: ${tx.hash}`)
+    console.log(`[Approve] ✅ Confirmed: ${tx.hash}`)
   }
 
   /**
    * Mint a new concentrated liquidity position.
+   * Returns tokenId, txHash, and optional swap metadata for P&L tracking.
    */
   async mintPosition(
     pool: PoolConfig,
     range: RangeRecommendation,
     amount0Desired: bigint,
     amount1Desired: bigint,
-  ): Promise<{ tokenId: bigint; txHash: string }> {
+  ): Promise<{ tokenId: bigint; txHash: string; swapMeta?: SwapMeta; mintGasUsd: number }> {
     const wallet = this.getWallet(pool.network)
     const nfpmAddress = NETWORKS[pool.network]!.nonfungiblePositionManager
     const provider = rpcClient.getProvider(pool.network)
 
-    // ── Fetch on-chain pool state ────────────────────────────────────────────
+    console.log(`\n[Mint] ── Starting mint for ${pool.token0.symbol}/${pool.token1.symbol} ──`)
+    console.log(`[Mint] Range: tick ${range.tickLower} → ${range.tickUpper}`)
+
+    // ── Step 1: Wrap ETH → WETH if possible ──────────────────────────────────
+    if (pool.token0.symbol === 'WETH') {
+      await this.wrapEthIfNeeded(pool)
+    }
+
+    // ── Step 2: Fetch pool state ──────────────────────────────────────────────
     const poolContract = new Contract(pool.address, POOL_STATE_ABI, provider)
     const [slot0, liquidityRaw] = await Promise.all([poolContract.slot0(), poolContract.liquidity()])
 
+    const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96.toString())
+    const currentTick = Number(slot0.tick)
+    const Q96 = 2n ** 96n
+    const decAdj = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
+    const sqrtPrice = Number(sqrtPriceX96) / Number(Q96)
+    const token0PriceUsd = sqrtPrice * sqrtPrice * decAdj
+
+    // ── Step 3: Read wallet balances ──────────────────────────────────────────
+    const token0Contract = new Contract(pool.token0.address, ERC20_ABI, provider)
+    const token1Contract = new Contract(pool.token1.address, ERC20_ABI, provider)
+    let [bal0, bal1]: [bigint, bigint] = await Promise.all([
+      token0Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString())),
+      token1Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString())),
+    ])
+
+    const bal0Human = Number(bal0) / Math.pow(10, pool.token0.decimals)
+    const bal1Human = Number(bal1) / Math.pow(10, pool.token1.decimals)
+    const totalUsd = bal0Human * token0PriceUsd + bal1Human
+    console.log(`[Mint] Wallet: ${bal0Human.toFixed(6)} ${pool.token0.symbol} + ${bal1Human.toFixed(4)} ${pool.token1.symbol} = $${totalUsd.toFixed(2)}`)
+
+    // ── Step 4: Calculate optimal ratio and decide swap ───────────────────────
+    const optimal = calcOptimalRatio(currentTick, range.tickLower, range.tickUpper, token0PriceUsd)
+    const target0Usd = totalUsd * optimal.ratio0
+    const current0Usd = bal0Human * token0PriceUsd
+    const imbalanceUsd = Math.abs(current0Usd - target0Usd)
+    const imbalancePct = totalUsd > 0 ? imbalanceUsd / totalUsd : 0
+
+    console.log(`[Mint] Optimal ratio: ${(optimal.ratio0 * 100).toFixed(1)}% ${pool.token0.symbol} / ${(optimal.ratio1 * 100).toFixed(1)}% ${pool.token1.symbol}`)
+    console.log(`[Mint] Current:  $${current0Usd.toFixed(2)} ${pool.token0.symbol} | Target: $${target0Usd.toFixed(2)} ${pool.token0.symbol}`)
+    console.log(`[Mint] Imbalance: $${imbalanceUsd.toFixed(2)} (${(imbalancePct * 100).toFixed(1)}%) — threshold ${SWAP_THRESHOLD * 100}%`)
+
+    let swapMeta: SwapMeta | undefined
+
+    if (imbalancePct > SWAP_THRESHOLD) {
+      if (current0Usd > target0Usd) {
+        // Too much token0 — swap excess WETH → USDC
+        const excessUsd = current0Usd - target0Usd
+        const excessToken0Raw = BigInt(Math.floor(excessUsd / token0PriceUsd * Math.pow(10, pool.token0.decimals)))
+        console.log(`[Mint] Too much ${pool.token0.symbol} — swapping $${excessUsd.toFixed(2)} worth → ${pool.token1.symbol}`)
+        const { receipt, amountOut } = await this.swapExact(pool, pool.token0, pool.token1, excessToken0Raw, token0PriceUsd)
+        swapMeta = this.buildSwapMeta(receipt, pool.token0, pool.token1, excessToken0Raw, amountOut, token0PriceUsd, true)
+      } else {
+        // Too much token1 — swap excess USDC → WETH
+        const excessUsd = target0Usd - current0Usd
+        const excessToken1Raw = BigInt(Math.floor(excessUsd * Math.pow(10, pool.token1.decimals)))
+        console.log(`[Mint] Too much ${pool.token1.symbol} — swapping $${excessUsd.toFixed(2)} worth → ${pool.token0.symbol}`)
+        const { receipt, amountOut } = await this.swapExact(pool, pool.token1, pool.token0, excessToken1Raw, token0PriceUsd)
+        swapMeta = this.buildSwapMeta(receipt, pool.token1, pool.token0, excessToken1Raw, amountOut, token0PriceUsd, false)
+      }
+
+      // Re-read balances after swap
+      ;[bal0, bal1] = await Promise.all([
+        token0Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString())),
+        token1Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString())),
+      ])
+      const newBal0 = Number(bal0) / Math.pow(10, pool.token0.decimals)
+      const newBal1 = Number(bal1) / Math.pow(10, pool.token1.decimals)
+      console.log(`[Mint] Post-swap: ${newBal0.toFixed(6)} ${pool.token0.symbol} + ${newBal1.toFixed(4)} ${pool.token1.symbol}`)
+    } else {
+      console.log(`[Mint] Imbalance within threshold — no swap needed`)
+    }
+
+    // ── Step 5: Build Uniswap position ────────────────────────────────────────
     const uniToken0 = new UniToken(this.chainId(pool), pool.token0.address, pool.token0.decimals, pool.token0.symbol)
     const uniToken1 = new UniToken(this.chainId(pool), pool.token1.address, pool.token1.decimals, pool.token1.symbol)
 
-    // ── Swap half of token1 → token0 if token0 balance is insufficient ──────
-    const token0Contract = new Contract(pool.token0.address, ERC20_ABI, provider)
-    const token0Balance: bigint = await token0Contract.balanceOf(wallet.address)
-    if (token0Balance < amount0Desired || token0Balance === 0n) {
-      console.log(`[Swap] token0 balance insufficient (${token0Balance} < ${amount0Desired}), swapping half of token1…`)
-      await this.swapHalfToToken0(pool, amount1Desired * 2n)
-    }
-
-    // ── Re-read balances after potential swap ────────────────────────────────
-    const token1Contract = new Contract(pool.token1.address, ERC20_ABI, provider)
-    const [bal0, bal1] = await Promise.all([
-      token0Contract.balanceOf(wallet.address).then((b: bigint) => BigInt(b.toString())),
-      token1Contract.balanceOf(wallet.address).then((b: bigint) => BigInt(b.toString())),
-    ])
-    // Use actual balances (don't exceed what we have)
-    const actual0 = bal0 < amount0Desired ? bal0 : amount0Desired
-    const actual1 = bal1 < amount1Desired ? bal1 : amount1Desired
-
     const uniPool = new Pool(
-      uniToken0,
-      uniToken1,
-      pool.feeTier,
-      slot0.sqrtPriceX96.toString(),
-      liquidityRaw.toString(),
-      Number(slot0.tick),
+      uniToken0, uniToken1, pool.feeTier,
+      slot0.sqrtPriceX96.toString(), liquidityRaw.toString(), currentTick,
     )
 
     const position = UniPosition.fromAmounts({
       pool: uniPool,
       tickLower: range.tickLower,
       tickUpper: range.tickUpper,
-      amount0: actual0.toString(),
-      amount1: actual1.toString(),
+      amount0: bal0.toString(),
+      amount1: bal1.toString(),
       useFullPrecision: true,
     })
 
     if (position.liquidity.toString() === '0') {
-      throw new Error(`Position liquidity is zero — bal0=${bal0} bal1=${bal1} price may be outside range`)
+      throw new Error(`Position liquidity is zero — bal0=${bal0} bal1=${bal1} tick=${currentTick} range=${range.tickLower}..${range.tickUpper}`)
     }
 
-    // ── Ensure token approvals (sequential to avoid nonce collision) ────────
-    await this.ensureApproval(pool.token0.address, actual0, pool.network)
-    await this.ensureApproval(pool.token1.address, actual1, pool.network)
+    console.log(`[Mint] Position liquidity: ${position.liquidity.toString()}`)
 
-    // ── Build calldata ───────────────────────────────────────────────────────
+    // ── Step 6: Approve and mint ──────────────────────────────────────────────
+    await this.ensureApproval(pool.token0.address, bal0, pool.network)
+    await this.ensureApproval(pool.token1.address, bal1, pool.network)
+
     const { calldata, value } = NonfungiblePositionManager.addCallParameters(position, {
       slippageTolerance: new Percent(50, 10_000), // 0.5%
       recipient: wallet.address,
       deadline: Math.floor(Date.now() / 1000) + 60 * 20,
     })
 
-    const tx = await wallet.sendTransaction({
-      to: nfpmAddress,
-      data: calldata,
-      value: BigInt(value),
-    })
-
-    console.log(`Mint tx submitted: ${tx.hash}`)
+    const tx = await wallet.sendTransaction({ to: nfpmAddress, data: calldata, value: BigInt(value) })
+    console.log(`[Mint] Tx submitted: ${tx.hash}`)
     const receipt = await tx.wait()
     if (!receipt || receipt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`)
 
-    // Parse tokenId from ERC721 Transfer event emitted by NFPM (mint = from address(0))
+    // ── Step 7: Parse tokenId from Transfer event ─────────────────────────────
     const transferTopic = ethers.id('Transfer(address,address,uint256)')
     const zeroAddress = '0x0000000000000000000000000000000000000000000000000000000000000000'
     const transferLog = receipt.logs.find(l =>
       l.address.toLowerCase() === nfpmAddress.toLowerCase() &&
       l.topics[0] === transferTopic &&
-      l.topics[1] === zeroAddress  // from = address(0) means mint
+      l.topics[1] === zeroAddress
     )
     if (!transferLog || !transferLog.topics[3]) {
-      throw new Error(`Mint tx succeeded (${tx.hash}) but could not find Transfer event to extract tokenId`)
+      throw new Error(`Mint tx succeeded (${tx.hash}) but could not find Transfer event`)
     }
     const tokenId = BigInt(transferLog.topics[3])
 
-    console.log(`Position minted. TokenId: ${tokenId}, tx: ${tx.hash}`)
-    return { tokenId, txHash: tx.hash }
+    // ── Step 8: Compute mint gas cost ─────────────────────────────────────────
+    const mintGasEth = Number(receipt.gasUsed * (receipt as any).gasPrice) / 1e18
+    const mintGasUsd = mintGasEth * token0PriceUsd
+    console.log(`[Mint] ✅ TokenId: ${tokenId} | gas: ${mintGasEth.toFixed(6)} ETH ($${mintGasUsd.toFixed(4)}) | tx: ${tx.hash}`)
+
+    return { tokenId, txHash: tx.hash, swapMeta, mintGasUsd }
   }
 
   /**
@@ -225,24 +380,21 @@ export class Executor {
     const nfpmAddress = NETWORKS[pool.network]!.nonfungiblePositionManager
     const provider = rpcClient.getProvider(pool.network)
 
-    // Always read real liquidity from NFPM to avoid stale DB values
+    console.log(`\n[Close] ── Closing position ${tokenId} ──`)
+
+    // Always read real liquidity from NFPM
     const NFPM_ABI_POS = ['function positions(uint256) external view returns (uint96,address,address,address,uint24,int24,int24,uint128,uint256,uint256,uint128,uint128)']
     const nfpm = new Contract(nfpmAddress, NFPM_ABI_POS, provider)
     const posData = await nfpm.positions(tokenId)
     const realLiquidity: bigint = BigInt(posData[7].toString())
-    console.log(`[Close] Real liquidity from chain: ${realLiquidity} (was: ${liquidity})`)
+    console.log(`[Close] Liquidity on-chain: ${realLiquidity} (DB had: ${liquidity})`)
 
     const poolContract = new Contract(pool.address, POOL_STATE_ABI, provider)
     const [slot0, liquidityRaw] = await Promise.all([poolContract.slot0(), poolContract.liquidity()])
 
     const uniToken0 = new UniToken(this.chainId(pool), pool.token0.address, pool.token0.decimals, pool.token0.symbol)
     const uniToken1 = new UniToken(this.chainId(pool), pool.token1.address, pool.token1.decimals, pool.token1.symbol)
-
-    const uniPool = new Pool(
-      uniToken0, uniToken1, pool.feeTier,
-      slot0.sqrtPriceX96.toString(), liquidityRaw.toString(), Number(slot0.tick),
-    )
-
+    const uniPool = new Pool(uniToken0, uniToken1, pool.feeTier, slot0.sqrtPriceX96.toString(), liquidityRaw.toString(), Number(slot0.tick))
     const position = new UniPosition({ pool: uniPool, tickLower, tickUpper, liquidity: realLiquidity.toString() })
 
     const { calldata, value } = NonfungiblePositionManager.removeCallParameters(position, {
@@ -258,11 +410,11 @@ export class Executor {
     })
 
     const tx = await wallet.sendTransaction({ to: nfpmAddress, data: calldata, value: BigInt(value) })
-    console.log(`Close tx submitted: ${tx.hash}`)
+    console.log(`[Close] Tx submitted: ${tx.hash}`)
     const receipt = await tx.wait()
     if (!receipt || receipt.status !== 1) throw new Error(`Close tx failed: ${tx.hash}`)
 
-    // Parse Collect event to log how much was actually received
+    // Parse Collect event for received amounts
     try {
       const collectTopic = ethers.id('Collect(uint256,address,uint256,uint256)')
       const collectLog = receipt.logs.find(l => l.topics[0] === collectTopic)
@@ -272,11 +424,13 @@ export class Executor {
         )
         const a0 = Number(amount0) / Math.pow(10, pool.token0.decimals)
         const a1 = Number(amount1) / Math.pow(10, pool.token1.decimals)
-        console.log(`[Close] Received: ${a0.toFixed(6)} ${pool.token0.symbol} + ${a1.toFixed(4)} ${pool.token1.symbol}`)
+        const gasEth = Number(receipt.gasUsed * (receipt as any).gasPrice) / 1e18
+        console.log(`[Close] ✅ Received: ${a0.toFixed(6)} ${pool.token0.symbol} + ${a1.toFixed(4)} ${pool.token1.symbol}`)
+        console.log(`[Close]    Gas: ${gasEth.toFixed(6)} ETH | tx: ${tx.hash}`)
       }
     } catch { /* non-critical */ }
 
-    console.log(`Position ${tokenId} closed. tx: ${tx.hash}`)
+    console.log(`[Close] Position ${tokenId} closed. tx: ${tx.hash}`)
     return tx.hash
   }
 
@@ -292,11 +446,12 @@ export class Executor {
     newRange: RangeRecommendation,
     amount0: bigint,
     amount1: bigint,
-  ): Promise<{ newTokenId: bigint; closeTxHash: string; mintTxHash: string }> {
-    console.log(`\nRebalancing position ${tokenId}…`)
+  ): Promise<{ newTokenId: bigint; closeTxHash: string; mintTxHash: string; swapMeta?: SwapMeta; mintGasUsd: number }> {
+    console.log(`\n[Rebalance] ── Starting rebalance of position ${tokenId} ──`)
     const closeTxHash = await this.closePosition(tokenId, pool, oldTickLower, oldTickUpper, oldLiquidity)
-    const { tokenId: newTokenId, txHash: mintTxHash } = await this.mintPosition(pool, newRange, amount0, amount1)
-    return { newTokenId, closeTxHash, mintTxHash }
+    const { tokenId: newTokenId, txHash: mintTxHash, swapMeta, mintGasUsd } = await this.mintPosition(pool, newRange, amount0, amount1)
+    console.log(`[Rebalance] ✅ Done: ${tokenId} → ${newTokenId}`)
+    return { newTokenId, closeTxHash, mintTxHash, swapMeta, mintGasUsd }
   }
 
   /**
@@ -307,12 +462,11 @@ export class Executor {
       const provider = rpcClient.getProvider(pool.network)
       const feeData = await provider.getFeeData()
       const gasPrice = feeData.gasPrice ?? 1_000_000_000n
-      // Typical rebalance: ~300K gas (close + mint)
       const gasUnits = 300_000n
       const gasCostEth = Number(gasPrice * gasUnits) / 1e18
       return gasCostEth * ethPriceUsd
     } catch {
-      return 2 // fallback $2 estimate
+      return 2
     }
   }
 
