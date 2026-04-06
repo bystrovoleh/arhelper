@@ -275,9 +275,6 @@ export class Executor {
     if (halfUsdc > 0n) {
       const { receipt, amountOut } = await this.swapExact(pool, pool.token1, pool.token0, halfUsdc, token0PriceUsd)
       results.push(this.buildSwapMeta(receipt, pool.token1, pool.token0, halfUsdc, amountOut, token0PriceUsd, false))
-      // Read WETH balance immediately after swap to verify
-      const wethAfterSwap: bigint = await token0Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
-      console.log(`[Consolidate] WETH balance immediately after swap: ${(Number(wethAfterSwap) / Math.pow(10, pool.token0.decimals)).toFixed(6)} (raw: ${wethAfterSwap})`)
     }
 
     // Verify final balances

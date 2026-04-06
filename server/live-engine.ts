@@ -120,19 +120,16 @@ export class LiveEngine {
       `).run(tokenId, txHash, mintGasUsd, Date.now())
     }
 
-    // Read actual on-chain position value (post-swap, post-mint) as entry capital
-    let realCapitalUsd = capitalUsd
+    // Entry capital = full wallet value before opening (includes anything not in position)
+    // Don't use fetchPositionAmounts here — it only shows what's inside the NFT,
+    // not the dust left on the wallet. actualCapitalUsd was measured before the mint.
     const onChain = await rpcClient.fetchPositionAmounts(
       onChainTokenId, pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
     )
-    if (onChain && (onChain.amount0 > 0 || onChain.amount1 > 0)) {
-      realCapitalUsd = onChain.amount0 * currentPrice + onChain.amount1
-      console.log(`[Live] Real capital from chain: $${realCapitalUsd.toFixed(2)} (desired: $${capitalUsd})`)
-    } else {
-      console.log(`[Live] fetchPositionAmounts returned 0, using wallet total as entry: $${realCapitalUsd.toFixed(2)}`)
-    }
+    const positionValueUsd = onChain ? onChain.amount0 * currentPrice + onChain.amount1 : 0
+    console.log(`[Live] Position value on-chain: $${positionValueUsd.toFixed(2)} | Entry capital (full wallet): $${actualCapitalUsd.toFixed(2)}`)
 
-    this.savePosition(tokenId, pool, range, state, onChain?.amount0 ?? token0Amount, onChain?.amount1 ?? token1Amount, currentPrice, realCapitalUsd, false)
+    this.savePosition(tokenId, pool, range, state, onChain?.amount0 ?? token0Amount, onChain?.amount1 ?? token1Amount, currentPrice, actualCapitalUsd, false)
 
     const totalSwapCostOpen = swapMetas.reduce((sum, m) => sum + (m.amountInUsd - m.amountOutUsd), 0)
     logEvent('POSITION_OPENED',
