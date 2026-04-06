@@ -297,7 +297,7 @@ export class Executor {
     range: RangeRecommendation,
     amount0Desired: bigint,
     amount1Desired: bigint,
-  ): Promise<{ tokenId: bigint; txHash: string; swapMetas: SwapMeta[]; mintGasUsd: number }> {
+  ): Promise<{ tokenId: bigint; txHash: string; swapMetas: SwapMeta[]; mintGasUsd: number; capitalUsd: number }> {
     const wallet = this.getWallet(pool.network)
     const nfpmAddress = NETWORKS[pool.network]!.nonfungiblePositionManager
     const provider = rpcClient.getProvider(pool.network)
@@ -391,7 +391,7 @@ export class Executor {
     const mintGasUsd = mintGasEth * token0PriceUsd
     console.log(`[Mint] ✅ TokenId: ${tokenId} | gas: ${mintGasEth.toFixed(6)} ETH ($${mintGasUsd.toFixed(4)}) | tx: ${tx.hash}`)
 
-    return { tokenId, txHash: tx.hash, swapMetas, mintGasUsd }
+    return { tokenId, txHash: tx.hash, swapMetas, mintGasUsd, capitalUsd: totalUsd }
   }
 
   /**
@@ -476,12 +476,12 @@ export class Executor {
     newRange: RangeRecommendation,
     amount0: bigint,
     amount1: bigint,
-  ): Promise<{ newTokenId: bigint; closeTxHash: string; mintTxHash: string; swapMetas: SwapMeta[]; mintGasUsd: number }> {
+  ): Promise<{ newTokenId: bigint; closeTxHash: string; mintTxHash: string; swapMetas: SwapMeta[]; mintGasUsd: number; capitalUsd: number }> {
     console.log(`\n[Rebalance] ── Starting rebalance of position ${tokenId} ──`)
     const closeTxHash = await this.closePosition(tokenId, pool, oldTickLower, oldTickUpper, oldLiquidity)
-    const { tokenId: newTokenId, txHash: mintTxHash, swapMetas, mintGasUsd } = await this.mintPosition(pool, newRange, amount0, amount1)
+    const { tokenId: newTokenId, txHash: mintTxHash, swapMetas, mintGasUsd, capitalUsd } = await this.mintPosition(pool, newRange, amount0, amount1)
     console.log(`[Rebalance] ✅ Done: ${tokenId} → ${newTokenId}`)
-    return { newTokenId, closeTxHash, mintTxHash, swapMetas, mintGasUsd }
+    return { newTokenId, closeTxHash, mintTxHash, swapMetas, mintGasUsd, capitalUsd }
   }
 
   /**

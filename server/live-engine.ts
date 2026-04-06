@@ -101,7 +101,7 @@ export class LiveEngine {
     }
 
     // ⚠️  REAL TRANSACTION
-    const { tokenId: onChainTokenId, txHash, swapMetas, mintGasUsd } = await executor.mintPosition(
+    const { tokenId: onChainTokenId, txHash, swapMetas, mintGasUsd, capitalUsd: postConsolidationCapital } = await executor.mintPosition(
       pool, range, amount0Raw, amount1Raw
     )
 
@@ -120,16 +120,15 @@ export class LiveEngine {
       `).run(tokenId, txHash, mintGasUsd, Date.now())
     }
 
-    // Entry capital = full wallet value before opening (includes anything not in position)
-    // Don't use fetchPositionAmounts here — it only shows what's inside the NFT,
-    // not the dust left on the wallet. actualCapitalUsd was measured before the mint.
+    // Entry capital = wallet total AFTER consolidation (post wrap+swap, pre-mint)
+    // This is the true deployed capital including anything not yet in the position
     const onChain = await rpcClient.fetchPositionAmounts(
       onChainTokenId, pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
     )
     const positionValueUsd = onChain ? onChain.amount0 * currentPrice + onChain.amount1 : 0
-    console.log(`[Live] Position value on-chain: $${positionValueUsd.toFixed(2)} | Entry capital (full wallet): $${actualCapitalUsd.toFixed(2)}`)
+    console.log(`[Live] Position value on-chain: $${positionValueUsd.toFixed(2)} | Entry capital (post-consolidation): $${postConsolidationCapital.toFixed(2)}`)
 
-    this.savePosition(tokenId, pool, range, state, onChain?.amount0 ?? token0Amount, onChain?.amount1 ?? token1Amount, currentPrice, actualCapitalUsd, false)
+    this.savePosition(tokenId, pool, range, state, onChain?.amount0 ?? token0Amount, onChain?.amount1 ?? token1Amount, currentPrice, postConsolidationCapital, false)
 
     const totalSwapCostOpen = swapMetas.reduce((sum, m) => sum + (m.amountInUsd - m.amountOutUsd), 0)
     logEvent('POSITION_OPENED',
@@ -281,7 +280,7 @@ export class LiveEngine {
       )
       if (!onChain || onChain.liquidity === 0n) throw new Error(`Cannot fetch on-chain position data for ${row.token_id} (liquidity=${onChain?.liquidity ?? 'null'}) — aborting rebalance`)
 
-      const { newTokenId, closeTxHash, mintTxHash, swapMetas, mintGasUsd } = await executor.rebalance(
+      const { newTokenId, closeTxHash, mintTxHash, swapMetas, mintGasUsd, capitalUsd: rebalanceCapital } = await executor.rebalance(
         BigInt(row.token_id),
         pool,
         row.tick_lower,
@@ -292,24 +291,22 @@ export class LiveEngine {
         BigInt(Math.floor(onChain.amount1 * Math.pow(10, pool.token1.decimals))),
       )
 
-      // Read real on-chain amounts for new position
+      // Read real on-chain amounts for new position (for token amounts only)
       const newOnChain = await rpcClient.fetchPositionAmounts(
         newTokenId, pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
       )
-      const newCapitalUsd = newOnChain
-        ? newOnChain.amount0 * currentPrice + newOnChain.amount1
-        : onChain.amount0 * currentPrice + onChain.amount1
 
       const newTokenIdStr = newTokenId.toString()
 
       // Update DB atomically: close old + save new in one transaction
+      // Use rebalanceCapital (post-consolidation wallet total) as entry capital
       db.transaction(() => {
         db.prepare(`UPDATE positions SET status = 'rebalanced', closed_at = ? WHERE token_id = ?`)
           .run(Date.now(), row.token_id)
         this.savePosition(newTokenIdStr, pool, newRange, state,
           newOnChain?.amount0 ?? onChain.amount0,
           newOnChain?.amount1 ?? onChain.amount1,
-          currentPrice, newCapitalUsd, false
+          currentPrice, rebalanceCapital, false
         )
         for (const meta of swapMetas) this.recordSwapEvent(newTokenIdStr, meta)
         if (mintGasUsd > 0) {
