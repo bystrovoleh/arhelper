@@ -130,6 +130,9 @@ export class Executor {
     if (!receipt || receipt.status !== 1) throw new Error(`Swap tx failed: ${tx.hash}`)
 
     // Parse actual amount out from Swap event
+    // Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, ...)
+    // sender+recipient are indexed (topics), amount0/amount1 are in data
+    // Convention: negative amount = tokens leaving the pool (i.e. received by user)
     let amountOut = minOut
     try {
       const swapTopic = ethers.id('Swap(address,address,int256,int256,uint160,uint128,int24)')
@@ -138,12 +141,17 @@ export class Executor {
         const decoded = ethers.AbiCoder.defaultAbiCoder().decode(
           ['int256', 'int256', 'uint160', 'uint128', 'int24'], swapLog.data
         )
-        const [amount0, amount1] = decoded as unknown as [bigint, bigint, bigint, bigint, number]
+        const amount0 = BigInt(decoded[0].toString())
+        const amount1 = BigInt(decoded[1].toString())
+        console.log(`[Swap] Event: amount0=${amount0} amount1=${amount1}`)
         const outIsToken0 = tokenOut.address.toLowerCase() === pool.token0.address.toLowerCase()
         const rawOut = outIsToken0 ? -amount0 : -amount1
         if (rawOut > 0n) amountOut = rawOut
+        else console.warn(`[Swap] Warning: rawOut=${rawOut} is not positive, falling back to minOut`)
       }
-    } catch { /* fallback to minOut */ }
+    } catch (e) {
+      console.warn(`[Swap] Failed to parse Swap event, using minOut: ${e}`)
+    }
 
     const amountOutHuman = Number(amountOut) / Math.pow(10, tokenOut.decimals)
     console.log(`[Swap] ✅ Received: ${amountOutHuman.toFixed(6)} ${tokenOut.symbol} | tx: ${tx.hash}`)
@@ -262,10 +270,22 @@ export class Executor {
     const halfUsdc = usdcBal / 2n
 
     console.log(`[Consolidate] Total USDC: ${usdcHuman.toFixed(4)}, swapping half (${(usdcHuman / 2).toFixed(4)}) → WETH`)
+    console.log(`[Consolidate] Wallet address: ${wallet.address}`)
 
     if (halfUsdc > 0n) {
       const { receipt, amountOut } = await this.swapExact(pool, pool.token1, pool.token0, halfUsdc, token0PriceUsd)
       results.push(this.buildSwapMeta(receipt, pool.token1, pool.token0, halfUsdc, amountOut, token0PriceUsd, false))
+      // Read WETH balance immediately after swap to verify
+      const wethAfterSwap: bigint = await token0Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
+      console.log(`[Consolidate] WETH balance immediately after swap: ${(Number(wethAfterSwap) / Math.pow(10, pool.token0.decimals)).toFixed(6)} (raw: ${wethAfterSwap})`)
+    }
+
+    // Verify final balances
+    const finalWeth: bigint = await token0Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
+    const finalUsdc: bigint = await token1Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
+    console.log(`[Consolidate] Final balances: ${(Number(finalWeth) / Math.pow(10, pool.token0.decimals)).toFixed(6)} WETH + ${(Number(finalUsdc) / Math.pow(10, pool.token1.decimals)).toFixed(4)} USDC`)
+    if (finalWeth === 0n && finalUsdc === 0n) {
+      throw new Error('[Consolidate] Both balances are zero after consolidation — aborting mint')
     }
 
     return results
