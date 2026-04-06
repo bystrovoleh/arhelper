@@ -16,7 +16,11 @@ import type { Position, PoolState } from '../src/types'
 // Executes REAL on-chain transactions on Arbitrum.
 // ⚠️  REAL MONEY — every openPosition/rebalance sends transactions.
 
-const MAX_CAPITAL_USD = Number(process.env['MAX_CAPITAL_USD'] ?? 100)
+const MAX_CAPITAL_USD = (() => {
+  const val = Number(process.env['MAX_CAPITAL_USD'] ?? 100)
+  if (isNaN(val) || val <= 0) throw new Error(`Invalid MAX_CAPITAL_USD: "${process.env['MAX_CAPITAL_USD']}"`)
+  return val
+})()
 const DRY_RUN = process.env['DRY_RUN'] === 'true'
 
 export class LiveEngine {
@@ -87,15 +91,15 @@ export class LiveEngine {
     }
 
     // ⚠️  REAL TRANSACTION
-    const { tokenId: onChainTokenId, txHash, swapMeta, mintGasUsd } = await executor.mintPosition(
+    const { tokenId: onChainTokenId, txHash, swapMetas, mintGasUsd } = await executor.mintPosition(
       pool, range, amount0Raw, amount1Raw
     )
 
     const tokenId = onChainTokenId.toString()
 
-    // Record swap event for P&L tracking
-    if (swapMeta) {
-      this.recordSwapEvent(tokenId, swapMeta)
+    // Record each swap event for P&L tracking
+    for (const meta of swapMetas) {
+      this.recordSwapEvent(tokenId, meta)
     }
 
     // Record mint gas cost as a swap event with 0 impact (just gas)
@@ -114,13 +118,16 @@ export class LiveEngine {
     if (onChain && (onChain.amount0 > 0 || onChain.amount1 > 0)) {
       realCapitalUsd = onChain.amount0 * currentPrice + onChain.amount1
       console.log(`[Live] Real capital from chain: $${realCapitalUsd.toFixed(2)} (desired: $${capitalUsd})`)
+    } else {
+      console.log(`[Live] fetchPositionAmounts returned 0, using wallet total as entry: $${realCapitalUsd.toFixed(2)}`)
     }
 
     this.savePosition(tokenId, pool, range, state, onChain?.amount0 ?? token0Amount, onChain?.amount1 ?? token1Amount, currentPrice, realCapitalUsd, false)
 
+    const totalSwapCostOpen = swapMetas.reduce((sum, m) => sum + (m.amountInUsd - m.amountOutUsd), 0)
     logEvent('POSITION_OPENED',
-      `LIVE position opened: ${pool.token0.symbol}/${pool.token1.symbol} @ $${currentPrice.toFixed(2)} | tx: ${txHash}${swapMeta ? ` | swap cost $${swapMeta.amountInUsd.toFixed(4)}→$${swapMeta.amountOutUsd.toFixed(4)}` : ''}`,
-      { poolAddress, tokenId, data: { range, capitalUsd, currentPrice, txHash, swapMeta, mintGasUsd } }
+      `LIVE position opened: ${pool.token0.symbol}/${pool.token1.symbol} @ $${currentPrice.toFixed(2)} | tx: ${txHash}${swapMetas.length > 0 ? ` | swap cost $${totalSwapCostOpen.toFixed(4)} (${swapMetas.length} swaps)` : ''}`,
+      { poolAddress, tokenId, data: { range, capitalUsd, currentPrice, txHash, swapMetas, mintGasUsd } }
     )
 
     console.log(`[Live] ✅ Position opened. TokenId: ${tokenId}, tx: ${txHash}`)
@@ -265,9 +272,9 @@ export class LiveEngine {
       const onChain = await rpcClient.fetchPositionAmounts(
         BigInt(row.token_id), pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
       )
-      if (!onChain) throw new Error(`Cannot fetch on-chain position data for ${row.token_id} — aborting rebalance`)
+      if (!onChain || onChain.liquidity === 0n) throw new Error(`Cannot fetch on-chain position data for ${row.token_id} (liquidity=${onChain?.liquidity ?? 'null'}) — aborting rebalance`)
 
-      const { newTokenId, closeTxHash, mintTxHash, swapMeta, mintGasUsd } = await executor.rebalance(
+      const { newTokenId, closeTxHash, mintTxHash, swapMetas, mintGasUsd } = await executor.rebalance(
         BigInt(row.token_id),
         pool,
         row.tick_lower,
@@ -278,11 +285,7 @@ export class LiveEngine {
         BigInt(Math.floor(onChain.amount1 * Math.pow(10, pool.token1.decimals))),
       )
 
-      // Close old position in DB
-      db.prepare(`UPDATE positions SET status = 'rebalanced', closed_at = ? WHERE token_id = ?`)
-        .run(Date.now(), row.token_id)
-
-      // Read real on-chain amounts for new position and save
+      // Read real on-chain amounts for new position
       const newOnChain = await rpcClient.fetchPositionAmounts(
         newTokenId, pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
       )
@@ -291,22 +294,27 @@ export class LiveEngine {
         : onChain.amount0 * currentPrice + onChain.amount1
 
       const newTokenIdStr = newTokenId.toString()
-      this.savePosition(newTokenIdStr, pool, newRange, state,
-        newOnChain?.amount0 ?? onChain.amount0,
-        newOnChain?.amount1 ?? onChain.amount1,
-        currentPrice, newCapitalUsd, false
-      )
 
-      // Record swap and gas costs for new position
-      if (swapMeta) this.recordSwapEvent(newTokenIdStr, swapMeta)
-      if (mintGasUsd > 0) {
-        db.prepare(`INSERT INTO swap_events (token_id, tx_hash, token_in, amount_in_usd, token_out, amount_out_usd, price_impact_pct, gas_usd, occurred_at) VALUES (?, ?, 'GAS', 0, 'GAS', 0, 0, ?, ?)`)
-          .run(newTokenIdStr, mintTxHash, mintGasUsd, Date.now())
-      }
+      // Update DB atomically: close old + save new in one transaction
+      db.transaction(() => {
+        db.prepare(`UPDATE positions SET status = 'rebalanced', closed_at = ? WHERE token_id = ?`)
+          .run(Date.now(), row.token_id)
+        this.savePosition(newTokenIdStr, pool, newRange, state,
+          newOnChain?.amount0 ?? onChain.amount0,
+          newOnChain?.amount1 ?? onChain.amount1,
+          currentPrice, newCapitalUsd, false
+        )
+        for (const meta of swapMetas) this.recordSwapEvent(newTokenIdStr, meta)
+        if (mintGasUsd > 0) {
+          db.prepare(`INSERT INTO swap_events (token_id, tx_hash, token_in, amount_in_usd, token_out, amount_out_usd, price_impact_pct, gas_usd, occurred_at) VALUES (?, ?, 'GAS', 0, 'GAS', 0, 0, ?, ?)`)
+            .run(newTokenIdStr, mintTxHash, mintGasUsd, Date.now())
+        }
+      })()
 
+      const totalSwapCost = swapMetas.reduce((sum, m) => sum + (m.amountInUsd - m.amountOutUsd), 0)
       logEvent('REBALANCE',
-        `[LIVE] Rebalance: ${row.token_id} → ${newTokenId} | close: ${closeTxHash} | mint: ${mintTxHash}${swapMeta ? ` | swap cost $${(swapMeta.amountInUsd - swapMeta.amountOutUsd).toFixed(4)}` : ''}`,
-        { poolAddress: pool.address, tokenId: newTokenIdStr, data: { newRange, closeTxHash, mintTxHash, swapMeta, mintGasUsd } }
+        `[LIVE] Rebalance: ${row.token_id} → ${newTokenId} | close: ${closeTxHash} | mint: ${mintTxHash}${swapMetas.length > 0 ? ` | swap cost $${totalSwapCost.toFixed(4)} (${swapMetas.length} swaps)` : ''}`,
+        { poolAddress: pool.address, tokenId: newTokenIdStr, data: { newRange, closeTxHash, mintTxHash, swapMetas, mintGasUsd } }
       )
 
       console.log(`[Live] ✅ Rebalanced → ${newTokenId}`)

@@ -87,6 +87,16 @@ db.exec(`
   );
 `)
 
+// ─── Indexes ──────────────────────────────────────────────────────────────────
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_positions_status    ON positions(status);
+  CREATE INDEX IF NOT EXISTS idx_positions_token_id  ON positions(token_id);
+  CREATE INDEX IF NOT EXISTS idx_snapshots_token_id  ON position_snapshots(token_id);
+  CREATE INDEX IF NOT EXISTS idx_swap_events_token   ON swap_events(token_id);
+  CREATE INDEX IF NOT EXISTS idx_pool_snaps_address  ON pool_snapshots(pool_address, recorded_at);
+  CREATE INDEX IF NOT EXISTS idx_events_type         ON events(type, occurred_at);
+`)
+
 // ─── Migrations ───────────────────────────────────────────────────────────────
 // Add new columns to existing DBs safely
 const existingCols = (db.prepare(`PRAGMA table_info(positions)`).all() as any[]).map(c => c.name)
