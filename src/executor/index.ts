@@ -225,27 +225,33 @@ export class Executor {
   }
 
   /**
-   * Consolidate wallet to 50/50 WETH/USDC split:
+   * Prepare wallet for minting:
    * 1. Wrap native ETH → WETH (keep gas reserve)
-   * 2. Swap all WETH → USDC
-   * 3. Swap half of total USDC → WETH
+   * 2. Swap all WETH → USDC (maximise stable)
+   * 3. Calculate exact WETH needed for the position ratio via SDK
+   * 4. Swap exactly that amount of USDC → WETH
    */
-  private async consolidateToUsdc(pool: PoolConfig): Promise<SwapMeta[]> {
+  private async consolidateToUsdc(
+    pool: PoolConfig,
+    tickLower: number,
+    tickUpper: number,
+  ): Promise<SwapMeta[]> {
     const wallet = this.getWallet(pool.network)
     const provider = rpcClient.getProvider(pool.network)
     const token0Contract = new Contract(pool.token0.address, ERC20_ABI, provider)
     const token1Contract = new Contract(pool.token1.address, ERC20_ABI, provider)
     const results: SwapMeta[] = []
 
-    // Get current price from pool
+    // Get current pool state
     const poolContract = new Contract(pool.address, POOL_STATE_ABI, provider)
-    const slot0 = await poolContract.slot0()
+    const [slot0, liquidityRaw] = await Promise.all([poolContract.slot0(), poolContract.liquidity()])
     const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96.toString())
+    const currentTick = Number(slot0.tick)
     const Q96 = 2n ** 96n
     const decAdj = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
     const sqrtPrice = Number(sqrtPriceX96) / Number(Q96)
     const token0PriceUsd = sqrtPrice * sqrtPrice * decAdj
-    console.log(`[Consolidate] token0PriceUsd = $${token0PriceUsd.toFixed(2)}`)
+    console.log(`[Consolidate] token0PriceUsd = $${token0PriceUsd.toFixed(2)} tick=${currentTick} range=${tickLower}..${tickUpper}`)
 
     // Step 1: Wrap ETH → WETH
     await this.wrapEthIfNeeded(pool)
@@ -253,7 +259,7 @@ export class Executor {
     // Step 2: Swap all WETH → USDC
     const wethBal: bigint = await token0Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
     const wethHuman = Number(wethBal) / Math.pow(10, pool.token0.decimals)
-    const dustThreshold = 0.0001 // ignore dust < 0.0001 WETH
+    const dustThreshold = 0.0001
 
     if (wethHuman > dustThreshold) {
       console.log(`[Consolidate] Swapping ${wethHuman.toFixed(6)} WETH → USDC`)
@@ -261,28 +267,59 @@ export class Executor {
       results.push(this.buildSwapMeta(receipt, pool.token0, pool.token1, wethBal, amountOut, token0PriceUsd, true))
       console.log(`[Consolidate] ✅ Got ${(Number(amountOut) / Math.pow(10, pool.token1.decimals)).toFixed(4)} USDC from WETH`)
     } else {
-      console.log(`[Consolidate] WETH balance ${wethHuman.toFixed(6)} is dust, skipping WETH→USDC swap`)
+      console.log(`[Consolidate] WETH ${wethHuman.toFixed(6)} is dust, skipping WETH→USDC`)
     }
 
-    // Step 3: Swap half of USDC → WETH
+    // Step 3: Calculate exact ratio needed for this position via SDK
     const usdcBal: bigint = await token1Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
     const usdcHuman = Number(usdcBal) / Math.pow(10, pool.token1.decimals)
-    const halfUsdc = usdcBal / 2n
 
-    console.log(`[Consolidate] Total USDC: ${usdcHuman.toFixed(4)}, swapping half (${(usdcHuman / 2).toFixed(4)}) → WETH`)
-    console.log(`[Consolidate] Wallet address: ${wallet.address}`)
-
-    if (halfUsdc > 0n) {
-      const { receipt, amountOut } = await this.swapExact(pool, pool.token1, pool.token0, halfUsdc, token0PriceUsd)
-      results.push(this.buildSwapMeta(receipt, pool.token1, pool.token0, halfUsdc, amountOut, token0PriceUsd, false))
+    // If tick is out of range entirely, no WETH needed (all USDC) or no USDC needed (all WETH)
+    let wethFraction = 0.5 // fallback
+    if (currentTick < tickLower) {
+      wethFraction = 1.0 // all WETH, no USDC
+    } else if (currentTick >= tickUpper) {
+      wethFraction = 0.0 // all USDC, no WETH
+    } else {
+      // In range: use SDK to find the natural ratio
+      try {
+        const uniToken0 = new UniToken(this.chainId(pool), pool.token0.address, pool.token0.decimals, pool.token0.symbol)
+        const uniToken1 = new UniToken(this.chainId(pool), pool.token1.address, pool.token1.decimals, pool.token1.symbol)
+        const uniPool = new Pool(uniToken0, uniToken1, pool.feeTier, sqrtPriceX96.toString(), liquidityRaw.toString(), currentTick)
+        const testPos = UniPosition.fromAmounts({
+          pool: uniPool, tickLower, tickUpper,
+          amount0: '1000000000000000000', // 1 WETH
+          amount1: '1000000000',          // 1000 USDC
+          useFullPrecision: true,
+        })
+        const a0 = Number(testPos.amount0.quotient.toString()) / Math.pow(10, pool.token0.decimals)
+        const a1 = Number(testPos.amount1.quotient.toString()) / Math.pow(10, pool.token1.decimals)
+        const v0 = a0 * token0PriceUsd
+        const v1 = a1
+        const total = v0 + v1
+        wethFraction = total > 0 ? v0 / total : 0.5
+        console.log(`[Consolidate] SDK ratio: ${(wethFraction * 100).toFixed(1)}% WETH / ${((1 - wethFraction) * 100).toFixed(1)}% USDC`)
+      } catch (e) {
+        console.warn(`[Consolidate] SDK ratio failed, using 50/50: ${e}`)
+      }
     }
 
-    // Verify final balances
+    // Step 4: Swap exactly the needed USDC fraction → WETH
+    const usdcForWeth = BigInt(Math.floor(Number(usdcBal) * wethFraction))
+    console.log(`[Consolidate] Total USDC: ${usdcHuman.toFixed(4)}, swapping ${(wethFraction * 100).toFixed(1)}% = ${(usdcHuman * wethFraction).toFixed(4)} → WETH`)
+
+    if (usdcForWeth > 0n) {
+      const { receipt, amountOut } = await this.swapExact(pool, pool.token1, pool.token0, usdcForWeth, token0PriceUsd)
+      results.push(this.buildSwapMeta(receipt, pool.token1, pool.token0, usdcForWeth, amountOut, token0PriceUsd, false))
+    }
+
+    // Verify
     const finalWeth: bigint = await token0Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
     const finalUsdc: bigint = await token1Contract.balanceOf(wallet.address).then((b: any) => BigInt(b.toString()))
-    console.log(`[Consolidate] Final balances: ${(Number(finalWeth) / Math.pow(10, pool.token0.decimals)).toFixed(6)} WETH + ${(Number(finalUsdc) / Math.pow(10, pool.token1.decimals)).toFixed(4)} USDC`)
+    const finalTotal = (Number(finalWeth) / Math.pow(10, pool.token0.decimals)) * token0PriceUsd + (Number(finalUsdc) / Math.pow(10, pool.token1.decimals))
+    console.log(`[Consolidate] Final: ${(Number(finalWeth) / Math.pow(10, pool.token0.decimals)).toFixed(6)} WETH + ${(Number(finalUsdc) / Math.pow(10, pool.token1.decimals)).toFixed(4)} USDC = $${finalTotal.toFixed(2)}`)
     if (finalWeth === 0n && finalUsdc === 0n) {
-      throw new Error('[Consolidate] Both balances are zero after consolidation — aborting mint')
+      throw new Error('[Consolidate] Both balances are zero — aborting mint')
     }
 
     return results
@@ -308,7 +345,7 @@ export class Executor {
     // ── Step 1: Consolidate everything → 50/50 WETH/USDC ────────────────────
     // Wrap ETH → WETH, then swap all WETH → USDC, then swap half USDC → WETH
     // This gives a predictable 50/50 split every time with minimum complexity.
-    const swapMetas = await this.consolidateToUsdc(pool)
+    const swapMetas = await this.consolidateToUsdc(pool, range.tickLower, range.tickUpper)
 
     // ── Step 2: Fetch pool state (fresh, post-swap) ───────────────────────────
     const poolContract = new Contract(pool.address, POOL_STATE_ABI, provider)
