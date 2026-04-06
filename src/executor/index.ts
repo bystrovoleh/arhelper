@@ -133,6 +133,24 @@ export class Executor {
     const uniToken0 = new UniToken(this.chainId(pool), pool.token0.address, pool.token0.decimals, pool.token0.symbol)
     const uniToken1 = new UniToken(this.chainId(pool), pool.token1.address, pool.token1.decimals, pool.token1.symbol)
 
+    // ── Swap half of token1 → token0 if token0 balance is insufficient ──────
+    const token0Contract = new Contract(pool.token0.address, ERC20_ABI, provider)
+    const token0Balance: bigint = await token0Contract.balanceOf(wallet.address)
+    if (token0Balance < amount0Desired || token0Balance === 0n) {
+      console.log(`[Swap] token0 balance insufficient (${token0Balance} < ${amount0Desired}), swapping half of token1…`)
+      await this.swapHalfToToken0(pool, amount1Desired * 2n)
+    }
+
+    // ── Re-read balances after potential swap ────────────────────────────────
+    const token1Contract = new Contract(pool.token1.address, ERC20_ABI, provider)
+    const [bal0, bal1] = await Promise.all([
+      token0Contract.balanceOf(wallet.address).then((b: bigint) => BigInt(b.toString())),
+      token1Contract.balanceOf(wallet.address).then((b: bigint) => BigInt(b.toString())),
+    ])
+    // Use actual balances (don't exceed what we have)
+    const actual0 = bal0 < amount0Desired ? bal0 : amount0Desired
+    const actual1 = bal1 < amount1Desired ? bal1 : amount1Desired
+
     const uniPool = new Pool(
       uniToken0,
       uniToken1,
@@ -146,22 +164,18 @@ export class Executor {
       pool: uniPool,
       tickLower: range.tickLower,
       tickUpper: range.tickUpper,
-      amount0: amount0Desired.toString(),
-      amount1: amount1Desired.toString(),
+      amount0: actual0.toString(),
+      amount1: actual1.toString(),
       useFullPrecision: true,
     })
 
-    // ── Swap half of token1 → token0 if token0 balance is insufficient ──────
-    const token0Contract = new Contract(pool.token0.address, ERC20_ABI, provider)
-    const token0Balance: bigint = await token0Contract.balanceOf(wallet.address)
-    if (token0Balance < amount0Desired) {
-      console.log(`[Swap] token0 balance insufficient (${token0Balance} < ${amount0Desired}), swapping half of token1…`)
-      await this.swapHalfToToken0(pool, amount1Desired * 2n)
+    if (position.liquidity.toString() === '0') {
+      throw new Error(`Position liquidity is zero — bal0=${bal0} bal1=${bal1} price may be outside range`)
     }
 
     // ── Ensure token approvals (sequential to avoid nonce collision) ────────
-    await this.ensureApproval(pool.token0.address, amount0Desired, pool.network)
-    await this.ensureApproval(pool.token1.address, amount1Desired, pool.network)
+    await this.ensureApproval(pool.token0.address, actual0, pool.network)
+    await this.ensureApproval(pool.token1.address, actual1, pool.network)
 
     // ── Build calldata ───────────────────────────────────────────────────────
     const { calldata, value } = NonfungiblePositionManager.addCallParameters(position, {
