@@ -134,13 +134,12 @@ export class Executor {
     let amountOut = minOut
     try {
       const swapTopic = ethers.id('Swap(address,address,int256,int256,uint160,uint128,int24)')
-      const swapLog = receipt.logs.find(l => l.topics[0] === swapTopic)
+      const swapLog = receipt.logs.find((l: any) => l.topics[0] === swapTopic)
       if (swapLog) {
         const decoded = ethers.AbiCoder.defaultAbiCoder().decode(
           ['int256', 'int256', 'uint160', 'uint128', 'int24'], swapLog.data
         )
-        // amount0 and amount1 are signed — positive = tokens entering pool, negative = leaving
-        const [amount0, amount1] = decoded
+        const [amount0, amount1] = decoded as unknown as [bigint, bigint, bigint, bigint, number]
         const outIsToken0 = tokenOut.address.toLowerCase() === pool.token0.address.toLowerCase()
         const rawOut = outIsToken0 ? -amount0 : -amount1
         if (rawOut > 0n) amountOut = rawOut
