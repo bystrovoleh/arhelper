@@ -318,11 +318,26 @@ export class LiveEngine {
       )
 
       // Auto-open on best pool if no live position open
-      const openCount = (db.prepare(
-        `SELECT COUNT(*) as c FROM positions WHERE status = 'open' AND is_paper = 0`
-      ).get() as any).c
+      // Check DB first — if open position exists, verify it still has liquidity on-chain
+      const openRows = db.prepare(
+        `SELECT token_id, pool_address FROM positions WHERE status = 'open' AND is_paper = 0`
+      ).all() as any[]
 
-      if (openCount === 0 && ranked.length > 0) {
+      let hasLivePosition = false
+      for (const row of openRows) {
+        if (!/^\d+$/.test(row.token_id)) { hasLivePosition = true; break }
+        const pool = WATCHED_POOLS.find(p => p.address === row.pool_address)
+        if (!pool) { hasLivePosition = true; break }  // unknown pool — assume open, don't touch
+        const onChain = await rpcClient.fetchPositionAmounts(
+          BigInt(row.token_id), pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
+        )
+        if (onChain && onChain.liquidity > 0n) { hasLivePosition = true; break }
+        // Liquidity is 0 on-chain but DB says open — sync DB
+        console.log(`[Live] Position ${row.token_id} has 0 liquidity on-chain, marking closed in DB`)
+        db.prepare(`UPDATE positions SET status='closed', closed_at=? WHERE token_id=?`).run(Date.now(), row.token_id)
+      }
+
+      if (!hasLivePosition && ranked.length > 0) {
         const best = ranked[0]!
         console.log(`[Live] No open position. Opening on ${best.pool.token0.symbol}/${best.pool.token1.symbol}…`)
         await this.openPosition(best.pool.address, MAX_CAPITAL_USD)
