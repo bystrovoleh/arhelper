@@ -3,18 +3,25 @@ dotenv.config()
 
 import { app } from './api'
 import { paperEngine } from './paper-engine'
+import { liveEngine } from './live-engine'
 
 const PORT = process.env['PORT'] ?? 3001
+const LIVE = process.env['LIVE'] === 'true'
 
 const server = app.listen(PORT, () => {
   console.log(`[Server] API running on http://localhost:${PORT}`)
-  paperEngine.start()
+  if (LIVE) {
+    console.log('[Server] ⚠️  LIVE MODE — real transactions enabled')
+    liveEngine.start()
+  } else {
+    paperEngine.start()
+  }
 })
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 function shutdown(signal: string) {
   console.log(`\n[Server] ${signal} received — shutting down gracefully...`)
-  paperEngine.stop()
+  if (LIVE) liveEngine.stop(); else paperEngine.stop()
   server.close(() => {
     console.log('[Server] HTTP server closed.')
     process.exit(0)
