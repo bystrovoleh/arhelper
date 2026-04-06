@@ -31,7 +31,17 @@ export class LiveEngine {
     console.log(`[Live] Engine starting… DRY_RUN=${DRY_RUN} MAX_CAPITAL=$${MAX_CAPITAL_USD}`)
     if (DRY_RUN) console.log('[Live] ⚠️  DRY RUN MODE — no real transactions will be sent')
     logEvent('INFO', `Live engine started. DRY_RUN=${DRY_RUN} MAX_CAPITAL=$${MAX_CAPITAL_USD}`)
-    this.rankAndMaybeOpen()
+
+    // Check DB for existing open positions before doing anything
+    const existingOpen = db.prepare(`SELECT COUNT(*) as c FROM positions WHERE status = 'open' AND is_paper = 0`).get() as any
+    if (existingOpen.c > 0) {
+      console.log(`[Live] Found ${existingOpen.c} open position(s) in DB — skipping auto-open on startup, monitoring only`)
+      this.monitorPositions()
+    } else {
+      console.log(`[Live] No open positions in DB — will rank pools and open on startup`)
+      this.rankAndMaybeOpen()
+    }
+
     this.monitorTimer = setInterval(() => this.monitorPositions(), 60_000)
     this.rankTimer = setInterval(() => this.rankAndMaybeOpen(), 30 * 60_000)
   }
