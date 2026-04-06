@@ -24,12 +24,75 @@ const POOL_STATE_ABI = [
   'function ticks(int24) external view returns (uint128, int128, uint256, uint256, int56, uint160, uint32, bool)',
 ]
 
+// Uniswap v3 SwapRouter02 on Arbitrum
+const SWAP_ROUTER = '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45'
+const SWAP_ROUTER_ABI = [
+  'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
+]
+
 // ─── Executor ─────────────────────────────────────────────────────────────────
 
 export class Executor {
   private getWallet(network: Network): Wallet {
     const provider = rpcClient.getProvider(network)
     return new Wallet(WALLET.privateKey, provider)
+  }
+
+  /**
+   * Swap 50% of token1 (USDC) to token0 (WETH) so we have both tokens for mint.
+   * Uses Uniswap v3 SwapRouter02 exactInputSingle with 1% slippage.
+   */
+  async swapHalfToToken0(pool: PoolConfig, token1AmountRaw: bigint): Promise<void> {
+    const wallet = this.getWallet(pool.network)
+    const halfAmount = token1AmountRaw / 2n
+
+    console.log(`[Swap] Swapping ${halfAmount} raw ${pool.token1.symbol} → ${pool.token0.symbol}…`)
+
+    // Approve SwapRouter for token1
+    await this.ensureApprovalFor(pool.token1.address, halfAmount, SWAP_ROUTER, pool.network)
+
+    // Estimate minimum output with 1% slippage using current pool price
+    const provider = rpcClient.getProvider(pool.network)
+    const poolContract = new Contract(pool.address, POOL_STATE_ABI, provider)
+    const slot0 = await poolContract.slot0()
+    const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96.toString())
+    const Q96 = 2n ** 96n
+    const decAdj = Math.pow(10, pool.token0.decimals - pool.token1.decimals)
+    const sqrtPrice = Number(sqrtPriceX96) / Number(Q96)
+    const currentPrice = sqrtPrice * sqrtPrice * decAdj // token0 per token1 (e.g. WETH per USDC)
+    // halfAmount is in token1 raw units; expected token0 out = halfAmount / 10^decimals1 * (1/price)
+    const expectedToken0 = (Number(halfAmount) / Math.pow(10, pool.token1.decimals)) / currentPrice
+    const minOut = BigInt(Math.floor(expectedToken0 * Math.pow(10, pool.token0.decimals) * 0.99)) // 1% slippage
+
+    const router = new Contract(SWAP_ROUTER, SWAP_ROUTER_ABI, wallet)
+    const tx = await router.exactInputSingle({
+      tokenIn: pool.token1.address,
+      tokenOut: pool.token0.address,
+      fee: pool.feeTier,
+      recipient: wallet.address,
+      amountIn: halfAmount,
+      amountOutMinimum: minOut,
+      sqrtPriceLimitX96: 0n,
+    })
+
+    console.log(`[Swap] Swap tx submitted: ${tx.hash}`)
+    const receipt = await tx.wait()
+    if (!receipt || receipt.status !== 1) throw new Error(`Swap tx failed: ${tx.hash}`)
+    console.log(`[Swap] Swap confirmed: ${tx.hash}`)
+  }
+
+  /**
+   * Approve a specific spender (not just NFPM).
+   */
+  async ensureApprovalFor(tokenAddress: string, amount: bigint, spender: string, network: Network): Promise<void> {
+    const wallet = this.getWallet(network)
+    const token = new Contract(tokenAddress, ERC20_ABI, wallet)
+    const allowance: bigint = await token.allowance(wallet.address, spender)
+    if (allowance >= amount) return
+    console.log(`Approving ${tokenAddress} for ${spender}…`)
+    const tx = await token.approve(spender, ethers.MaxUint256)
+    await tx.wait()
+    console.log(`Approval confirmed: ${tx.hash}`)
   }
 
   /**
@@ -88,11 +151,17 @@ export class Executor {
       useFullPrecision: true,
     })
 
-    // ── Ensure token approvals ───────────────────────────────────────────────
-    await Promise.all([
-      this.ensureApproval(pool.token0.address, amount0Desired, pool.network),
-      this.ensureApproval(pool.token1.address, amount1Desired, pool.network),
-    ])
+    // ── Swap half of token1 → token0 if token0 balance is insufficient ──────
+    const token0Contract = new Contract(pool.token0.address, ERC20_ABI, provider)
+    const token0Balance: bigint = await token0Contract.balanceOf(wallet.address)
+    if (token0Balance < amount0Desired) {
+      console.log(`[Swap] token0 balance insufficient (${token0Balance} < ${amount0Desired}), swapping half of token1…`)
+      await this.swapHalfToToken0(pool, amount1Desired * 2n)
+    }
+
+    // ── Ensure token approvals (sequential to avoid nonce collision) ────────
+    await this.ensureApproval(pool.token0.address, amount0Desired, pool.network)
+    await this.ensureApproval(pool.token1.address, amount1Desired, pool.network)
 
     // ── Build calldata ───────────────────────────────────────────────────────
     const { calldata, value } = NonfungiblePositionManager.addCallParameters(position, {
@@ -111,10 +180,18 @@ export class Executor {
     const receipt = await tx.wait()
     if (!receipt || receipt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`)
 
-    // Parse tokenId from Transfer event (ERC721 mint)
+    // Parse tokenId from ERC721 Transfer event emitted by NFPM (mint = from address(0))
     const transferTopic = ethers.id('Transfer(address,address,uint256)')
-    const transferLog = receipt.logs.find(l => l.topics[0] === transferTopic)
-    const tokenId = transferLog ? BigInt(transferLog.topics[3] ?? '0') : 0n
+    const zeroAddress = '0x0000000000000000000000000000000000000000000000000000000000000000'
+    const transferLog = receipt.logs.find(l =>
+      l.address.toLowerCase() === nfpmAddress.toLowerCase() &&
+      l.topics[0] === transferTopic &&
+      l.topics[1] === zeroAddress  // from = address(0) means mint
+    )
+    if (!transferLog || !transferLog.topics[3]) {
+      throw new Error(`Mint tx succeeded (${tx.hash}) but could not find Transfer event to extract tokenId`)
+    }
+    const tokenId = BigInt(transferLog.topics[3])
 
     console.log(`Position minted. TokenId: ${tokenId}, tx: ${tx.hash}`)
     return { tokenId, txHash: tx.hash }
@@ -134,6 +211,13 @@ export class Executor {
     const nfpmAddress = NETWORKS[pool.network]!.nonfungiblePositionManager
     const provider = rpcClient.getProvider(pool.network)
 
+    // Always read real liquidity from NFPM to avoid stale DB values
+    const NFPM_ABI_POS = ['function positions(uint256) external view returns (uint96,address,address,address,uint24,int24,int24,uint128,uint256,uint256,uint128,uint128)']
+    const nfpm = new Contract(nfpmAddress, NFPM_ABI_POS, provider)
+    const posData = await nfpm.positions(tokenId)
+    const realLiquidity: bigint = BigInt(posData[7].toString())
+    console.log(`[Close] Real liquidity from chain: ${realLiquidity} (was: ${liquidity})`)
+
     const poolContract = new Contract(pool.address, POOL_STATE_ABI, provider)
     const [slot0, liquidityRaw] = await Promise.all([poolContract.slot0(), poolContract.liquidity()])
 
@@ -145,7 +229,7 @@ export class Executor {
       slot0.sqrtPriceX96.toString(), liquidityRaw.toString(), Number(slot0.tick),
     )
 
-    const position = new UniPosition({ pool: uniPool, tickLower, tickUpper, liquidity: liquidity.toString() })
+    const position = new UniPosition({ pool: uniPool, tickLower, tickUpper, liquidity: realLiquidity.toString() })
 
     const { calldata, value } = NonfungiblePositionManager.removeCallParameters(position, {
       tokenId: tokenId.toString(),
@@ -163,6 +247,20 @@ export class Executor {
     console.log(`Close tx submitted: ${tx.hash}`)
     const receipt = await tx.wait()
     if (!receipt || receipt.status !== 1) throw new Error(`Close tx failed: ${tx.hash}`)
+
+    // Parse Collect event to log how much was actually received
+    try {
+      const collectTopic = ethers.id('Collect(uint256,address,uint256,uint256)')
+      const collectLog = receipt.logs.find(l => l.topics[0] === collectTopic)
+      if (collectLog) {
+        const [, amount0, amount1] = ethers.AbiCoder.defaultAbiCoder().decode(
+          ['address', 'uint256', 'uint256'], collectLog.data
+        )
+        const a0 = Number(amount0) / Math.pow(10, pool.token0.decimals)
+        const a1 = Number(amount1) / Math.pow(10, pool.token1.decimals)
+        console.log(`[Close] Received: ${a0.toFixed(6)} ${pool.token0.symbol} + ${a1.toFixed(4)} ${pool.token1.symbol}`)
+      }
+    } catch { /* non-critical */ }
 
     console.log(`Position ${tokenId} closed. tx: ${tx.hash}`)
     return tx.hash

@@ -91,6 +91,67 @@ export class RpcClient {
     }
   }
 
+  // Fetch real token amounts for a Uniswap v3 position from NFPM
+  async fetchPositionAmounts(
+    tokenId: bigint,
+    network: Network,
+    poolAddress: string,
+    token0Decimals: number,
+    token1Decimals: number,
+  ): Promise<{ amount0: number; amount1: number; liquidity: bigint } | null> {
+    try {
+      const provider = this.getProvider(network)
+      const nfpmAddress = NETWORKS[network]!.nonfungiblePositionManager
+
+      const NFPM_ABI = [
+        'function positions(uint256 tokenId) external view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+      ]
+      const nfpm = new Contract(nfpmAddress, NFPM_ABI, provider)
+      const pos = await nfpm.positions(tokenId)
+
+      const liquidity = BigInt(pos.liquidity.toString())
+      if (liquidity === 0n) return { amount0: 0, amount1: 0, liquidity: 0n }
+
+      // Get current sqrtPrice from pool
+      const state = await this.fetchPoolState(poolAddress, network, token0Decimals, token1Decimals)
+      const sqrtPriceX96 = state.sqrtPriceX96
+      const Q96 = 2n ** 96n
+
+      const tickLower = Number(pos.tickLower)
+      const tickUpper = Number(pos.tickUpper)
+      const currentTick = state.tick
+
+      // sqrtPrice at tick boundaries
+      const sqrtRatioA = BigInt(Math.round(Math.sqrt(Math.pow(1.0001, tickLower)) * Number(Q96)))
+      const sqrtRatioB = BigInt(Math.round(Math.sqrt(Math.pow(1.0001, tickUpper)) * Number(Q96)))
+      const sqrtRatioCurrent = sqrtPriceX96
+
+      let amount0 = 0n
+      let amount1 = 0n
+
+      if (currentTick < tickLower) {
+        // All token0
+        amount0 = liquidity * (sqrtRatioB - sqrtRatioA) / (sqrtRatioA * sqrtRatioB / Q96)
+      } else if (currentTick >= tickUpper) {
+        // All token1
+        amount1 = liquidity * (sqrtRatioB - sqrtRatioA) / Q96
+      } else {
+        // Mixed
+        amount0 = liquidity * (sqrtRatioB - sqrtRatioCurrent) / (sqrtRatioCurrent * sqrtRatioB / Q96)
+        amount1 = liquidity * (sqrtRatioCurrent - sqrtRatioA) / Q96
+      }
+
+      return {
+        amount0: Number(amount0) / Math.pow(10, token0Decimals),
+        amount1: Number(amount1) / Math.pow(10, token1Decimals),
+        liquidity,
+      }
+    } catch (err) {
+      console.warn('[rpc] fetchPositionAmounts failed:', String(err))
+      return null
+    }
+  }
+
   // Fetch tick data for a specific tick index
   async fetchTick(poolAddress: string, tickIndex: number, network: Network) {
     const provider = this.getProvider(network)

@@ -1,5 +1,6 @@
 import { Position, PoolState, RebalanceSignal } from '../types'
 import { db } from '../../server/db'
+import { WATCHED_POOLS } from '../config'
 
 // ── Rebalance rules ───────────────────────────────────────────────────────────
 // Goal: rebalance as rarely as possible to minimize gas + IL crystallization.
@@ -8,11 +9,13 @@ import { db } from '../../server/db'
 // Rules:
 //   1. Position must be at least 8h old
 //   2. Price must be out of range for 4h+ consecutively
-//   3. Price must be ≥3% beyond the range boundary (not just 1 tick out)
+//   3. Price must be ≥7% beyond the range boundary (not just 1 tick out)
 //   4. Price must NOT be returning toward range (no reversal in last 30 min)
 
 const MIN_DISTANCE_PCT = 0.07  // price must be 7%+ beyond boundary
 const REVERSAL_WINDOW_MS = 30 * 60_000  // 30 min reversal check
+const MIN_POSITION_AGE_MS = 3 * 3_600_000  // position must be 3h+ old
+const MIN_OUT_OF_RANGE_MS = 4 * 3_600_000  // must be out of range for 4h+
 
 export class RebalanceTrigger {
   evaluate(
@@ -26,6 +29,17 @@ export class RebalanceTrigger {
     const rangeWidth = tickUpper - tickLower
     const centerPct = ((currentTick - tickLower) / rangeWidth * 100).toFixed(1)
 
+    // ── Rule 1: position must be at least 8h old ─────────────────────────────
+    const ageMs = Date.now() - (position.openedAt ?? 0)
+    if (ageMs < MIN_POSITION_AGE_MS) {
+      return {
+        shouldRebalance: false,
+        reason: `Position too young (${(ageMs / 3_600_000).toFixed(1)}h < 8h required)`,
+        urgency: 'low',
+        currentTick, tickLower, tickUpper,
+      }
+    }
+
     // ── In range ─────────────────────────────────────────────────────────────
     if (currentTick >= tickLower && currentTick < tickUpper) {
       return {
@@ -36,10 +50,23 @@ export class RebalanceTrigger {
       }
     }
 
-    // ── Out of range — apply all checks ──────────────────────────────────────
+    // ── Rule 2: must be out of range for 4h+ ─────────────────────────────────
+    const outOfRangeSince = this.getOutOfRangeSince(position.poolAddress, tickLower, tickUpper)
+    const outOfRangeMs = outOfRangeSince ? Date.now() - outOfRangeSince : 0
+    if (outOfRangeMs < MIN_OUT_OF_RANGE_MS) {
+      return {
+        shouldRebalance: false,
+        reason: `Out of range but only for ${(outOfRangeMs / 3_600_000).toFixed(1)}h (need 4h+)`,
+        urgency: 'medium',
+        currentTick, tickLower, tickUpper,
+      }
+    }
 
-    // Rule 3: price must be ≥3% beyond boundary
-    const decimalAdj = 1e12 // WETH/USDC
+    // ── Out of range — apply remaining checks ─────────────────────────────────
+
+    // Rule 3: price must be ≥7% beyond boundary
+    const poolCfg = WATCHED_POOLS.find(p => p.address.toLowerCase() === position.poolAddress.toLowerCase())
+    const decimalAdj = Math.pow(10, (poolCfg?.token0.decimals ?? 18) - (poolCfg?.token1.decimals ?? 6))
     const priceLower = Math.pow(1.0001, tickLower) * decimalAdj
     const priceUpper = Math.pow(1.0001, tickUpper) * decimalAdj
 
@@ -80,7 +107,31 @@ export class RebalanceTrigger {
     }
   }
 
-  // Check if price is moving back toward the range in recent snapshots
+  private getOutOfRangeSince(poolAddress: string, tickLower: number, tickUpper: number): number | null {
+    try {
+      const snaps = db.prepare(`
+        SELECT recorded_at, tick FROM pool_snapshots
+        WHERE pool_address = ? AND recorded_at >= ?
+        ORDER BY recorded_at ASC
+      `).all(poolAddress, Date.now() - 24 * 3_600_000) as Array<{ recorded_at: number; tick: number }>
+
+      if (snaps.length === 0) return null
+
+      // Walk backwards: find last snapshot where tick was in range
+      for (let i = snaps.length - 1; i >= 0; i--) {
+        const s = snaps[i]!
+        if (s.tick >= tickLower && s.tick < tickUpper) {
+          return snaps[i + 1]?.recorded_at ?? null
+        }
+      }
+
+      // All 24h was out of range — use oldest snapshot time
+      return snaps[0]!.recorded_at
+    } catch {
+      return null
+    }
+  }
+
   private isPriceReturning(
     poolAddress: string,
     currentPrice: number,
@@ -101,12 +152,10 @@ export class RebalanceTrigger {
       const priceUpper = Math.pow(1.0001, tickUpper) * decimalAdj
       const midRange = (priceLower + priceUpper) / 2
 
-      // Check if price trend is toward range center
       const oldest = recentSnaps[0]!.current_price
       const distOld = Math.abs(oldest - midRange)
       const distNew = Math.abs(currentPrice - midRange)
 
-      // Returning if current price is closer to range than 30 min ago
       return distNew < distOld * 0.95
     } catch {
       return false

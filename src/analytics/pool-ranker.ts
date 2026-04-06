@@ -14,15 +14,22 @@ export interface RankedPool {
 // ─── Pool Ranker ──────────────────────────────────────────────────────────────
 
 export class PoolRanker {
+  private cache: { ranked: RankedPool[]; ts: number } | null = null
+  private readonly CACHE_TTL = 15 * 60_000  // 15 min — don't re-fetch GeckoTerminal on every restart
+
   /**
    * Rank all watched pools by estimated concentrated APY.
    * Returns pools sorted best → worst.
    */
   async rankPools(currentPrices: Map<string, number>): Promise<RankedPool[]> {
+    if (this.cache && Date.now() - this.cache.ts < this.CACHE_TTL) {
+      return this.cache.ranked
+    }
+
     const ranked: RankedPool[] = []
 
     for (const pool of WATCHED_POOLS) {
-      if (ranked.length > 0) await new Promise(r => setTimeout(r, 2000))
+      if (ranked.length > 0) await new Promise(r => setTimeout(r, 5000))  // 5s between requests
       let market: PoolMarketData | null = null
       try {
         market = await geckoTerminalClient.fetchPool(pool.address, pool.network, pool.feeTier)
@@ -50,7 +57,9 @@ export class PoolRanker {
       ranked.push({ pool, market, estimatedConcentratedApy, score, range })
     }
 
-    return ranked.sort((a, b) => b.score - a.score)
+    const result = ranked.sort((a, b) => b.score - a.score)
+    if (result.length > 0) this.cache = { ranked: result, ts: Date.now() }
+    return result
   }
 
   buildDefaultRange(currentPrice: number, rangePct: number): RangeRecommendation {

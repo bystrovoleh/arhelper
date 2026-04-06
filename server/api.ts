@@ -1,12 +1,16 @@
 import express from 'express'
 import cors from 'cors'
-import { db } from './db'
+import { db, logEvent } from './db'
 import { paperEngine } from './paper-engine'
+import { liveEngine } from './live-engine'
+import { executor } from '../src/executor'
 import { WATCHED_POOLS } from '../src/config'
 import { rpcClient } from '../src/data-layer/rpc-client'
 import { geckoTerminalClient } from '../src/data-layer/geckoterminal-client'
 import { liquidityDistribution } from '../src/analytics/liquidity-distribution'
 import { detectVolatilityRegime, calcInRangeTime, gasAdjustedRebalance } from '../src/analytics/range-analytics'
+
+const LIVE = process.env['LIVE'] === 'true'
 
 export const app = express()
 app.use(cors())
@@ -25,6 +29,36 @@ app.get('/api/positions', (_req, res) => {
     ORDER BY p.opened_at DESC
   `).all()
   res.json(positions)
+})
+
+// Close a live position on-chain
+app.post('/api/positions/:tokenId/close', async (req, res) => {
+  const { tokenId } = req.params
+  const row = db.prepare(`SELECT * FROM positions WHERE token_id = ? AND status = 'open'`).get(tokenId) as any
+  if (!row) { res.status(404).json({ error: 'Open position not found' }); return }
+
+  const pool = WATCHED_POOLS.find(p => p.address === row.pool_address)
+  if (!pool) { res.status(400).json({ error: 'Pool not found' }); return }
+
+  try {
+    if (LIVE && !/^live-dry/.test(tokenId)) {
+      const txHash = await executor.closePosition(
+        BigInt(tokenId), pool,
+        row.tick_lower, row.tick_upper,
+        BigInt(row.liquidity ?? 0),
+      )
+      db.prepare(`UPDATE positions SET status = 'closed', closed_at = ? WHERE token_id = ?`).run(Date.now(), tokenId)
+      logEvent('INFO', `[LIVE] Position ${tokenId} closed manually. tx: ${txHash}`, { tokenId })
+      res.json({ ok: true, txHash })
+    } else {
+      // Paper / dry-run: just mark closed
+      db.prepare(`UPDATE positions SET status = 'closed', closed_at = ? WHERE token_id = ?`).run(Date.now(), tokenId)
+      logEvent('INFO', `Position ${tokenId} closed manually (paper/dry)`, { tokenId })
+      res.json({ ok: true, txHash: null })
+    }
+  } catch (err) {
+    res.status(500).json({ error: String(err) })
+  }
 })
 
 app.get('/api/positions/:tokenId', (req, res) => {

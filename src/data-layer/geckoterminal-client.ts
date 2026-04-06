@@ -18,9 +18,11 @@ interface GeckoPool {
 
 // ─── GeckoTerminal Client ─────────────────────────────────────────────────────
 
+const MIN_REQUEST_INTERVAL_MS = 15_000  // 15s between requests — stay well under rate limit
+
 export class GeckoTerminalClient {
   private client: AxiosInstance
-  // Map our network names to GeckoTerminal network slugs
+  private lastRequestAt = 0
   private networkMap: Record<string, string> = {
     base: 'base',
     arbitrum: 'arbitrum',
@@ -35,7 +37,16 @@ export class GeckoTerminalClient {
     })
   }
 
+  private async throttle(): Promise<void> {
+    const elapsed = Date.now() - this.lastRequestAt
+    if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+      await new Promise(r => setTimeout(r, MIN_REQUEST_INTERVAL_MS - elapsed))
+    }
+    this.lastRequestAt = Date.now()
+  }
+
   async fetchPool(poolAddress: string, network: string, feeTier?: number): Promise<PoolMarketData | null> {
+    await this.throttle()
     const networkSlug = this.networkMap[network] ?? network
     try {
       const { data } = await this.client.get(`/networks/${networkSlug}/pools/${poolAddress}`)
@@ -84,6 +95,7 @@ export class GeckoTerminalClient {
 
   // Get OHLCV for price range analysis (hourly, last 24h)
   async fetchOhlcv(poolAddress: string, network: string, timeframe: 'minute' | 'hour' | 'day' = 'hour', limit = 24) {
+    await this.throttle()
     const networkSlug = this.networkMap[network] ?? network
     try {
       const { data } = await this.client.get(
@@ -99,6 +111,7 @@ export class GeckoTerminalClient {
 
   // Fetch older candles before a given timestamp (for pagination)
   async fetchOhlcvBefore(poolAddress: string, network: string, timeframe: 'minute' | 'hour' | 'day', limit: number, beforeTimestamp: number) {
+    await this.throttle()
     const networkSlug = this.networkMap[network] ?? network
     try {
       const { data } = await this.client.get(

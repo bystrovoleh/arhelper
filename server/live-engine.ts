@@ -1,3 +1,4 @@
+import { Contract } from 'ethers'
 import { db, logEvent } from './db'
 import { rpcClient } from '../src/data-layer/rpc-client'
 import { geckoTerminalClient } from '../src/data-layer/geckoterminal-client'
@@ -56,20 +57,27 @@ export class LiveEngine {
     const range = rangeCalculator.buildAgentRange(currentPrice, pool, candles)
       ?? rangeCalculator.buildSymmetricRange(currentPrice, pool, 0.15)
 
-    // Split capital 50/50 between token0 and token1
-    const token0AmountUsd = capitalUsd / 2
-    const token1AmountUsd = capitalUsd / 2
-    const token0Amount = token0AmountUsd / currentPrice
-    const token1Amount = token1AmountUsd
+    // Read real wallet balances — use them directly, don't assume 50/50 split
+    const provider = rpcClient.getProvider(pool.network)
+    const ERC20_ABI = ['function balanceOf(address) external view returns (uint256)']
+    const [bal0Raw, bal1Raw]: [bigint, bigint] = await Promise.all([
+      new Contract(pool.token0.address, ERC20_ABI, provider).balanceOf(WALLET.address).then((b: bigint) => BigInt(b.toString())),
+      new Contract(pool.token1.address, ERC20_ABI, provider).balanceOf(WALLET.address).then((b: bigint) => BigInt(b.toString())),
+    ])
+    const token0Amount = Number(bal0Raw) / Math.pow(10, pool.token0.decimals)
+    const token1Amount = Number(bal1Raw) / Math.pow(10, pool.token1.decimals)
+    const actualCapitalUsd = token0Amount * currentPrice + token1Amount
+    console.log(`[Live]   Wallet: ${token0Amount.toFixed(6)} ${pool.token0.symbol} + ${token1Amount.toFixed(4)} ${pool.token1.symbol} = $${actualCapitalUsd.toFixed(2)}`)
 
-    // Convert to raw token amounts (with decimals)
-    const amount0Raw = BigInt(Math.floor(token0Amount * Math.pow(10, pool.token0.decimals)))
-    const amount1Raw = BigInt(Math.floor(token1Amount * Math.pow(10, pool.token1.decimals)))
+    // Cap to MAX_CAPITAL_USD — use proportional fraction if wallet has more
+    const fraction = Math.min(1, capitalUsd / actualCapitalUsd)
+    const amount0Raw = BigInt(Math.floor(Number(bal0Raw) * fraction))
+    const amount1Raw = BigInt(Math.floor(Number(bal1Raw) * fraction))
 
     console.log(`[Live] Opening position: ${pool.token0.symbol}/${pool.token1.symbol}`)
     console.log(`[Live]   Price: $${currentPrice.toFixed(2)}`)
     console.log(`[Live]   Range: ${range.reason}`)
-    console.log(`[Live]   Capital: $${capitalUsd} (${token0Amount.toFixed(6)} ${pool.token0.symbol} + ${token1Amount.toFixed(2)} ${pool.token1.symbol})`)
+    console.log(`[Live]   Capital: $${(actualCapitalUsd * fraction).toFixed(2)} (${(token0Amount * fraction).toFixed(6)} ${pool.token0.symbol} + ${(token1Amount * fraction).toFixed(4)} ${pool.token1.symbol})`)
 
     if (DRY_RUN) {
       console.log('[Live] DRY RUN — skipping real transaction')
@@ -84,7 +92,18 @@ export class LiveEngine {
     )
 
     const tokenId = onChainTokenId.toString()
-    this.savePosition(tokenId, pool, range, state, token0Amount, token1Amount, currentPrice, capitalUsd, false)
+
+    // Read actual on-chain position value (post-swap, post-mint) as entry capital
+    let realCapitalUsd = capitalUsd
+    const onChain = await rpcClient.fetchPositionAmounts(
+      onChainTokenId, pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
+    )
+    if (onChain && (onChain.amount0 > 0 || onChain.amount1 > 0)) {
+      realCapitalUsd = onChain.amount0 * currentPrice + onChain.amount1
+      console.log(`[Live] Real capital from chain: $${realCapitalUsd.toFixed(2)} (desired: $${capitalUsd})`)
+    }
+
+    this.savePosition(tokenId, pool, range, state, onChain?.amount0 ?? token0Amount, onChain?.amount1 ?? token1Amount, currentPrice, realCapitalUsd, false)
 
     logEvent('POSITION_OPENED',
       `LIVE position opened: ${pool.token0.symbol}/${pool.token1.symbol} @ $${currentPrice.toFixed(2)} | tx: ${txHash}`,
@@ -115,6 +134,14 @@ export class LiveEngine {
         const currentPrice = state.token0Price
         const inRange = state.tick >= row.tick_lower && state.tick < row.tick_upper
 
+        // ── Real token amounts from chain (for live positions) ─────────────────
+        const tokenId = /^\d+$/.test(row.token_id) ? BigInt(row.token_id) : null
+        const onChain = tokenId
+          ? await rpcClient.fetchPositionAmounts(tokenId, pool.network, pool.address, pool.token0.decimals, pool.token1.decimals)
+          : null
+        const token0Amount = onChain?.amount0 ?? row.token0_amount
+        const token1Amount = onChain?.amount1 ?? row.token1_amount
+
         // ── Fee accrual ────────────────────────────────────────────────────────
         const feesUsd = inRange ? this.calcRealFees(row, state) : (
           (db.prepare(`SELECT COALESCE(MAX(fees_usd), 0) as total FROM position_snapshots WHERE token_id = ?`).get(row.token_id) as any).total
@@ -126,8 +153,8 @@ export class LiveEngine {
         const priceUpper = Math.pow(1.0001, row.tick_upper) * decAdj
         const ilPct = apyCalculator.calculateImpermanentLoss(row.entry_price, currentPrice, priceLower, priceUpper)
 
-        // ── P&L ────────────────────────────────────────────────────────────────
-        const currentValueUsd = row.token0_amount * currentPrice + row.token1_amount + feesUsd
+        // ── P&L: use real on-chain amounts ────────────────────────────────────
+        const currentValueUsd = token0Amount * currentPrice + token1Amount + feesUsd
         const pnlUsd = currentValueUsd - row.entry_price_usd
 
         // ── Snapshot ───────────────────────────────────────────────────────────
@@ -138,7 +165,7 @@ export class LiveEngine {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           row.token_id, Date.now(), currentPrice,
-          row.token0_amount, row.token1_amount,
+          token0Amount, token1Amount,
           feesUsd / 2 / currentPrice, feesUsd / 2,
           feesUsd, ilPct, pnlUsd, inRange ? 1 : 0
         )
@@ -162,7 +189,7 @@ export class LiveEngine {
 
         // ── Rebalance check ────────────────────────────────────────────────────
         const position: Position = {
-          tokenId: BigInt(row.token_id),
+          tokenId: /^\d+$/.test(row.token_id) ? BigInt(row.token_id) : 0n,
           poolAddress: row.pool_address,
           tickLower: row.tick_lower,
           tickUpper: row.tick_upper,
@@ -221,25 +248,40 @@ export class LiveEngine {
 
     // ⚠️  REAL TRANSACTIONS: close old → open new
     try {
+      // Fetch real on-chain amounts before rebalancing (don't trust stale DB values)
+      const onChain = await rpcClient.fetchPositionAmounts(
+        BigInt(row.token_id), pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
+      )
+      if (!onChain) throw new Error(`Cannot fetch on-chain position data for ${row.token_id} — aborting rebalance`)
+
       const { newTokenId, closeTxHash, mintTxHash } = await executor.rebalance(
         BigInt(row.token_id),
         pool,
         row.tick_lower,
         row.tick_upper,
-        BigInt(row.liquidity ?? 0),
+        onChain.liquidity,
         newRange,
-        BigInt(Math.floor(row.token0_amount * Math.pow(10, pool.token0.decimals))),
-        BigInt(Math.floor(row.token1_amount * Math.pow(10, pool.token1.decimals))),
+        BigInt(Math.floor(onChain.amount0 * Math.pow(10, pool.token0.decimals))),
+        BigInt(Math.floor(onChain.amount1 * Math.pow(10, pool.token1.decimals))),
       )
 
       // Close old position in DB
       db.prepare(`UPDATE positions SET status = 'rebalanced', closed_at = ? WHERE token_id = ?`)
         .run(Date.now(), row.token_id)
 
-      // Save new position in DB
+      // Read real on-chain amounts for new position and save
+      const newOnChain = await rpcClient.fetchPositionAmounts(
+        newTokenId, pool.network, pool.address, pool.token0.decimals, pool.token1.decimals
+      )
+      const newCapitalUsd = newOnChain
+        ? newOnChain.amount0 * currentPrice + newOnChain.amount1
+        : onChain.amount0 * currentPrice + onChain.amount1
+
       this.savePosition(
         newTokenId.toString(), pool, newRange, state,
-        row.token0_amount, row.token1_amount, currentPrice, row.entry_price_usd, false
+        newOnChain?.amount0 ?? onChain.amount0,
+        newOnChain?.amount1 ?? onChain.amount1,
+        currentPrice, newCapitalUsd, false
       )
 
       logEvent('REBALANCE',

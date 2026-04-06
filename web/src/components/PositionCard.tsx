@@ -1,3 +1,6 @@
+import { useState } from 'react'
+import { apiPost } from '../hooks/useApi'
+
 interface Position {
   token_id: string
   token0_symbol: string
@@ -15,6 +18,8 @@ interface Position {
   il_pct?: number
   pnl_usd?: number
   in_range?: number
+  token0_amount?: number
+  token1_amount?: number
 }
 
 const tickToPrice = (tick: number) => Math.pow(1.0001, tick) * 1e12
@@ -110,6 +115,18 @@ export function PositionCard({ pos }: { pos: Position }) {
     : null
 
   const isOpen = pos.status === 'open'
+  const [closing, setClosing] = useState(false)
+
+  async function handleClose() {
+    if (!confirm(`Close position ${pos.token_id}? This will send a real transaction.`)) return
+    setClosing(true)
+    try {
+      await apiPost(`/api/positions/${pos.token_id}/close`, {})
+      window.location.reload()
+    } finally {
+      setClosing(false)
+    }
+  }
 
   return (
     <div style={{
@@ -146,6 +163,19 @@ export function PositionCard({ pos }: { pos: Position }) {
           <div style={{ color: 'var(--text2)', fontSize: 12, marginTop: 1 }}>
             {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}% on capital
           </div>
+          {isOpen && (
+            <button
+              onClick={handleClose}
+              disabled={closing}
+              style={{
+                marginTop: 8, padding: '4px 12px', borderRadius: 6, border: '1px solid rgba(239,68,68,0.4)',
+                background: 'rgba(239,68,68,0.1)', color: 'var(--red)', fontSize: 11,
+                fontWeight: 600, cursor: 'pointer', opacity: closing ? 0.6 : 1,
+              }}
+            >
+              {closing ? 'Closing…' : 'Close Position'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -183,6 +213,53 @@ export function PositionCard({ pos }: { pos: Position }) {
             value: priceChangeFromEntry != null ? `${priceChangeFromEntry >= 0 ? '+' : ''}${priceChangeFromEntry.toFixed(2)}%` : '—',
             sub: `entry $${pos.entry_price.toFixed(0)}`,
             color: priceChangeFromEntry != null && priceChangeFromEntry >= 0 ? 'var(--green)' : 'var(--red)',
+          },
+        ].map(s => (
+          <div key={s.label} style={{ background: 'var(--bg3)', borderRadius: 8, padding: '10px 12px' }}>
+            <div style={{ color: 'var(--text2)', fontSize: 11, marginBottom: 4 }}>{s.label}</div>
+            <div style={{ fontWeight: 600, color: s.color, fontSize: 14 }}>{s.value}</div>
+            {s.sub && <div style={{ color: 'var(--text2)', fontSize: 10, marginTop: 2 }}>{s.sub}</div>}
+          </div>
+        ))}
+      </div>
+
+      {/* Second stats row */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginTop: 10 }}>
+        {[
+          {
+            label: 'Position Value',
+            value: pos.current_price
+              ? `$${((pos.token0_amount ?? 0) * pos.current_price + (pos.token1_amount ?? 0) + fees).toFixed(2)}`
+              : '—',
+            sub: `entry $${pos.entry_price_usd.toFixed(2)}`,
+            color: 'var(--text)',
+          },
+          {
+            label: 'Composition',
+            value: pos.current_price && pos.token0_amount != null && pos.token1_amount != null
+              ? (() => {
+                  const v0 = pos.token0_amount * pos.current_price
+                  const v1 = pos.token1_amount
+                  const total = v0 + v1
+                  return total > 0 ? `${(v0/total*100).toFixed(0)}% / ${(v1/total*100).toFixed(0)}%` : '—'
+                })()
+              : '—',
+            sub: `${pos.token0_symbol} / ${pos.token1_symbol}`,
+            color: 'var(--text2)',
+          },
+          {
+            label: 'Range Width',
+            value: `±${((priceUpper / priceLower - 1) * 50 * 100).toFixed(1)}%`,
+            sub: `$${priceLower.toFixed(0)} – $${priceUpper.toFixed(0)}`,
+            color: 'var(--text2)',
+          },
+          {
+            label: 'APY Est.',
+            value: ageHours > 1 && fees > 0 && pos.entry_price_usd > 0
+              ? `${((fees / ageHours * 24 * 365 / pos.entry_price_usd) * 100).toFixed(1)}%`
+              : '—',
+            sub: ageHours > 1 ? `based on ${ageHours.toFixed(1)}h` : 'accumulating…',
+            color: 'var(--green)',
           },
         ].map(s => (
           <div key={s.label} style={{ background: 'var(--bg3)', borderRadius: 8, padding: '10px 12px' }}>
