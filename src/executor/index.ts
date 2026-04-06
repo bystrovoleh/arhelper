@@ -266,29 +266,37 @@ export class Executor {
     // ── Step 4: Calculate optimal ratio and decide swap ───────────────────────
     const optimal = calcOptimalRatio(currentTick, range.tickLower, range.tickUpper, token0PriceUsd)
     const target0Usd = totalUsd * optimal.ratio0
+    const target1Usd = totalUsd * optimal.ratio1
     const current0Usd = bal0Human * token0PriceUsd
+    const current1Usd = bal1Human
     const imbalanceUsd = Math.abs(current0Usd - target0Usd)
     const imbalancePct = totalUsd > 0 ? imbalanceUsd / totalUsd : 0
 
     console.log(`[Mint] Optimal ratio: ${(optimal.ratio0 * 100).toFixed(1)}% ${pool.token0.symbol} / ${(optimal.ratio1 * 100).toFixed(1)}% ${pool.token1.symbol}`)
-    console.log(`[Mint] Current:  $${current0Usd.toFixed(2)} ${pool.token0.symbol} | Target: $${target0Usd.toFixed(2)} ${pool.token0.symbol}`)
+    console.log(`[Mint] Current:  $${current0Usd.toFixed(2)} ${pool.token0.symbol} / $${current1Usd.toFixed(2)} ${pool.token1.symbol}`)
+    console.log(`[Mint] Target:   $${target0Usd.toFixed(2)} ${pool.token0.symbol} / $${target1Usd.toFixed(2)} ${pool.token1.symbol}`)
     console.log(`[Mint] Imbalance: $${imbalanceUsd.toFixed(2)} (${(imbalancePct * 100).toFixed(1)}%) — threshold ${SWAP_THRESHOLD * 100}%`)
 
     let swapMeta: SwapMeta | undefined
 
-    if (imbalancePct > SWAP_THRESHOLD) {
-      if (current0Usd > target0Usd) {
+    // Safety check: if position needs token1 but we have none — always swap regardless of threshold
+    const needsBothTokens = currentTick >= range.tickLower && currentTick < range.tickUpper
+    const missingToken1 = needsBothTokens && bal1 === 0n
+    const missingToken0 = needsBothTokens && bal0 === 0n
+
+    if (imbalancePct > SWAP_THRESHOLD || missingToken1 || missingToken0) {
+      if (current0Usd > target0Usd || missingToken1) {
         // Too much token0 — swap excess WETH → USDC
-        const excessUsd = current0Usd - target0Usd
+        const excessUsd = missingToken1 ? totalUsd * 0.5 : (current0Usd - target0Usd)
         const excessToken0Raw = BigInt(Math.floor(excessUsd / token0PriceUsd * Math.pow(10, pool.token0.decimals)))
-        console.log(`[Mint] Too much ${pool.token0.symbol} — swapping $${excessUsd.toFixed(2)} worth → ${pool.token1.symbol}`)
+        console.log(`[Mint] Too much ${pool.token0.symbol}${missingToken1 ? ' (no token1 at all)' : ''} — swapping $${excessUsd.toFixed(2)} → ${pool.token1.symbol}`)
         const { receipt, amountOut } = await this.swapExact(pool, pool.token0, pool.token1, excessToken0Raw, token0PriceUsd)
         swapMeta = this.buildSwapMeta(receipt, pool.token0, pool.token1, excessToken0Raw, amountOut, token0PriceUsd, true)
       } else {
         // Too much token1 — swap excess USDC → WETH
-        const excessUsd = target0Usd - current0Usd
+        const excessUsd = missingToken0 ? totalUsd * 0.5 : (target0Usd - current0Usd)
         const excessToken1Raw = BigInt(Math.floor(excessUsd * Math.pow(10, pool.token1.decimals)))
-        console.log(`[Mint] Too much ${pool.token1.symbol} — swapping $${excessUsd.toFixed(2)} worth → ${pool.token0.symbol}`)
+        console.log(`[Mint] Too much ${pool.token1.symbol}${missingToken0 ? ' (no token0 at all)' : ''} — swapping $${excessUsd.toFixed(2)} → ${pool.token0.symbol}`)
         const { receipt, amountOut } = await this.swapExact(pool, pool.token1, pool.token0, excessToken1Raw, token0PriceUsd)
         swapMeta = this.buildSwapMeta(receipt, pool.token1, pool.token0, excessToken1Raw, amountOut, token0PriceUsd, false)
       }
